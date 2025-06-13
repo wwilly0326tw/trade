@@ -84,20 +84,23 @@ def backtest_qqq_put_income_strategy(
     weeks_in_trade = 0
     trade_count = 0
     all_events_log = []
-    month_last_option_sell_attempt = 0  # Added for correct monthly logic    # Loop through each week
+    month_last_option_sell_attempt = (
+        0  # Added for correct monthly logic    # Loop through each week
+    )
     for i in range(len(qqq_data)):
         current_week_data = qqq_data.iloc[i]
         current_week_date = qqq_data.index[i]
         current_month = qqq_data["Month"].iloc[i]
+        newly_assigned_this_week = False
+        put_settled_this_week = False  # 任何PUT結算（到期或執行）都會設為True
 
         can_trade_next_week = i + 1 < len(qqq_data)
         next_week_open_price = (
             qqq_data["Open"].iloc[i + 1] if can_trade_next_week else None
-        )        newly_assigned_this_week = False
-        put_settled_this_week = False  # 任何PUT結算（到期或執行）都會設為True
-
-        # --- DTE-Based Put Settlement ---
+        )  # --- DTE-Based Put Settlement ---
         remaining_open_positions = []
+        put_just_expired = False
+        expired_put_date = None
         for position in open_put_positions:
             # PUT在到期日當週或之後才結算
             if position["expiration_date"] <= current_week_date:
@@ -114,15 +117,17 @@ def backtest_qqq_put_income_strategy(
                     trade_count += 1
                     all_events_log.append(
                         {
-                            "date": position["expiration_date"],
-                            "log": f"[{position['expiration_date'].strftime('%Y-%m-%d')}]: PUT ASSIGNED. Bought {shares_assigned} QQQ at strike ${position['strike_price']:.2f} (Sold on {position['sell_date'].strftime('%Y-%m-%d')}, Originally Expired {position['expiration_date'].strftime('%Y-%m-%d')}). Cost: ${cost:.2f}. Capital: ${capital:.2f}. Shares: {shares:.2f}",
+                            "date": event_date_for_log,
+                            "log": f"[{event_date_for_log.strftime('%Y-%m-%d')}]: PUT ASSIGNED. Bought {shares_assigned} QQQ at strike ${position['strike_price']:.2f} (Sold on {position['sell_date'].strftime('%Y-%m-%d')}, Originally Expired {event_date_for_log.strftime('%Y-%m-%d')}). Cost: ${cost:.2f}. Capital: ${capital:.2f}. Shares: {shares:.2f}",
                         }
                     )
                 else:
+                    put_just_expired = True
+                    expired_put_date = event_date_for_log
                     all_events_log.append(
                         {
-                            "date": position["expiration_date"],
-                            "log": f"[{position['expiration_date'].strftime('%Y-%m-%d')}]: PUTS EXPIRED WORTHLESS. Strike: ${position['strike_price']:.2f} (Sold on {position['sell_date'].strftime('%Y-%m-%d')}, Originally Expired {position['expiration_date'].strftime('%Y-%m-%d')})",
+                            "date": event_date_for_log,
+                            "log": f"[{event_date_for_log.strftime('%Y-%m-%d')}]: PUTS EXPIRED WORTHLESS. Strike: ${position['strike_price']:.2f} (Sold on {position['sell_date'].strftime('%Y-%m-%d')}, Originally Expired {event_date_for_log.strftime('%Y-%m-%d')})",
                         }
                     )
             else:
@@ -132,8 +137,41 @@ def backtest_qqq_put_income_strategy(
         if newly_assigned_this_week:
             weeks_in_trade = 0
 
-        # --- Put Selling (修正：PUT到期失效當天就可以賣新PUT，只有PUT被執行才不能賣) ---
-        if (
+        # --- Put Selling (PUT到期失效當天立即賣新PUT) ---
+        if put_just_expired and not in_qqq_position and expired_put_date:
+            current_spot_price = current_week_data["Close"]
+            if current_spot_price > 0.01:
+                strike_price_for_new_puts = current_spot_price * (
+                    1 - put_strike_percentage_below_spot
+                )
+                if strike_price_for_new_puts > 0.01:
+                    max_contracts = math.floor(
+                        capital / (strike_price_for_new_puts * 100.0)
+                    )
+                    if max_contracts > 0:
+                        premium_received = max_contracts * premium_per_put_contract
+                        capital += premium_received
+                        expiration_date_calc = expired_put_date + pd.Timedelta(
+                            days=days_to_expiration
+                        )
+                        open_put_positions.append(
+                            {
+                                "sell_date": expired_put_date,
+                                "expiration_date": expiration_date_calc,
+                                "strike_price": strike_price_for_new_puts,
+                                "contracts": max_contracts,
+                                "premium_total": premium_received,
+                            }
+                        )
+                        all_events_log.append(
+                            {
+                                "date": expired_put_date,
+                                "log": f"[{expired_put_date.strftime('%Y-%m-%d')}]: SOLD {max_contracts} Puts (SAME DAY after expiry). Strike: ${strike_price_for_new_puts:.2f}, Premium: ${premium_received:.2f}, Expires: {expiration_date_calc.strftime('%Y-%m-%d')}. Capital: ${capital:.2f}",
+                            }
+                        )
+
+        # --- 正常PUT賣出邏輯（沒有未到期PUT且沒持有QQQ時）---
+        elif (
             not in_qqq_position
             and len(open_put_positions) == 0
             and not newly_assigned_this_week  # 只有PUT被執行時才阻止賣新PUT
@@ -152,7 +190,8 @@ def backtest_qqq_put_income_strategy(
                         capital += premium_received
                         expiration_date_calc = current_week_date + pd.Timedelta(
                             days=days_to_expiration
-                        )                        open_put_positions.append(
+                        )
+                        open_put_positions.append(
                             {
                                 "sell_date": current_week_date,
                                 "expiration_date": expiration_date_calc,
@@ -167,6 +206,7 @@ def backtest_qqq_put_income_strategy(
                                 "log": f"[{current_week_date.strftime('%Y-%m-%d')}]: SOLD {max_contracts} Puts. Strike: ${strike_price_for_new_puts:.2f}, Premium: ${premium_received:.2f}, Expires: {expiration_date_calc.strftime('%Y-%m-%d')}. Capital: ${capital:.2f}",
                             }
                         )
+        # ...existing code...
 
         # --- Trading Logic (Modified for same-day execution) ---
         if not in_qqq_position:
@@ -186,7 +226,9 @@ def backtest_qqq_put_income_strategy(
                             f"[{current_week_date.strftime('%Y-%m-%d')} Market Drop]: ENTER QQQ. Buy {shares:,.2f} shares at ${current_close_price:,.2f}. "
                             f"Capital before: ${capital_before_buy:,.2f}, Capital after: ${capital:.2f}"
                         )
-                        all_events_log.append({"date": current_week_date, "log": log_entry})
+                        all_events_log.append(
+                            {"date": current_week_date, "log": log_entry}
+                        )
         elif in_qqq_position:  # If in QQQ
             weeks_in_trade += 1
             if current_week_data["WeeklyReturn"] > exit_rebound_threshold:
@@ -238,15 +280,15 @@ def backtest_qqq_put_income_strategy(
 
 if __name__ == "__main__":
     # Run the backtest with specified parameters
-    start_date = "2025-01-01"
+    start_date = "2024-01-01"
     end_date = "2025-12-31"
     test_data = [
         {
             "initial_capital": 100000.0,
             "start_date": start_date,
             "end_date": end_date,
-            "entry_drop_threshold": -0.06,
-            "exit_rebound_threshold": 0.09,
+            "entry_drop_threshold": -0.16,
+            "exit_rebound_threshold": 0.10,
             "premium_per_put_contract": 292.0,
             "put_strike_percentage_below_spot": 0.06,
             "days_to_expiration": 30,
