@@ -1,68 +1,24 @@
 {
-  "spy_put_aug21": {
+  "spy_put_aug29": {
     "symbol": "SPY",
-    "expiry": "20250821",
-    "strike": 580.0,
+    "expiry": "20250829",
+    "strike": 600.0,
     "right": "PUT",
     "exchange": "SMART",
     "currency": "USD",
-    "delta": -0.15,
-    "premium": 2.50,
+    "delta": -0.2,
+    "premium": 4.26,
     "action": "SELL"
   },
-  "spy_call_aug21": {
+  "spy_call_aug29": {
     "symbol": "SPY",
-    "expiry": "20250821",
-    "strike": 620.0,
+    "expiry": "20250829",
+    "strike": 660.0,
     "right": "CALL",
     "exchange": "SMART",
     "currency": "USD",
     "delta": 0.15,
-    "premium": 1.80,
-    "action": "SELL"
-  },
-  "spy_put_sep19": {
-    "symbol": "SPY",
-    "expiry": "20250919",
-    "strike": 575.0,
-    "right": "PUT",
-    "exchange": "SMART",
-    "currency": "USD",
-    "delta": -0.18,
-    "premium": 3.20,
-    "action": "SELL"
-  },
-  "spy_call_sep19": {
-    "symbol": "SPY",
-    "expiry": "20250919",
-    "strike": 625.0,
-    "right": "CALL",
-    "exchange": "SMART",
-    "currency": "USD",
-    "delta": 0.18,
-    "premium": 2.40,
-    "action": "SELL"
-  },
-  "spy_put_oct17": {
-    "symbol": "SPY",
-    "expiry": "20251017",
-    "strike": 570.0,
-    "right": "PUT",
-    "exchange": "SMART",
-    "currency": "USD",
-    "delta": -0.20,
-    "premium": 4.10,
-    "action": "SELL"
-  },
-  "spy_call_oct17": {
-    "symbol": "SPY",
-    "expiry": "20251017",
-    "strike": 630.0,
-    "right": "CALL",
-    "exchange": "SMART",
-    "currency": "USD",
-    "delta": 0.20,
-    "premium": 3.50,
+    "premium": 1.256,
     "action": "SELL"
   }
 }
