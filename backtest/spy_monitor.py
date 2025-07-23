@@ -25,7 +25,7 @@ PORT = 4002  # Paper: 7497 / 4002
 CID = random.randint(1000, 9999)
 TICK_LIST_OPT = "106"  # 要求 Option Greeks (IV / Δ)
 TIMEOUT = 5.0  # 單檔行情等待秒數
-CHECK_INTERVAL = 10  # 監控輪詢秒數
+CHECK_INTERVAL = 60  # 監控輪詢秒數
 DEBUG = False  # True 時打印完整 Tick
 
 # LINE Messaging API ── 使用者提供的長期權杖（若環境變數未設則採用此值）
@@ -60,7 +60,7 @@ def line_push(msg: str):
 class StrategyConfig:
     delta_threshold: float = 0.30
     profit_target: float = 0.50  # 50%
-    min_dte: int = 36
+    min_dte: int = 21
 
 
 @dataclass
