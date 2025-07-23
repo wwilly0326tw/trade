@@ -22,7 +22,7 @@ PORT = 4002  # Paper: 7497 / 4002
 CID = random.randint(1000, 9999)
 TICK_LIST_OPT = "106"  # 要求 Option Greeks (IV / Δ)
 TIMEOUT = 5.0  # 單檔行情等待秒數
-CHECK_INTERVAL = 60  # 監控輪詢秒數
+CHECK_INTERVAL = 10  # 監控輪詢秒數
 DEBUG = False  # True 時打印完整 Tick
 
 # LINE Messaging API ── 使用者提供的長期權杖（若環境變數未設則採用此值）
@@ -210,6 +210,9 @@ class AlertEngine:
         self.spy_con.exchange = "SMART"
         self.spy_con.currency = "USD"
         self.spy_prev_close: float | None = None
+        # 記錄已發送的警報及發送日期
+        self.sent_alerts: Dict[str, datetime.date] = {}
+        self.current_date = datetime.date.today()
 
     def _dte(self, expiry: str) -> int:
         expire = datetime.datetime.strptime(expiry, "%Y%m%d").date()
@@ -226,8 +229,19 @@ class AlertEngine:
         self.spy_prev_close = snap.get("close") or snap.get("price")
         print(f"SPY 昨收 {self.spy_prev_close}")
 
+    def _check_alert_deduplication(self):
+        """檢查是否需要重置今日警報紀錄（日期變更時）"""
+        today = datetime.date.today()
+        if today > self.current_date:
+            print(f"日期變更: {self.current_date} → {today}，重置警報紀錄")
+            self.sent_alerts.clear()
+            self.current_date = today
+
     def loop(self):
         while True:
+            # 檢查是否需要重置警報紀錄（新的一天）
+            self._check_alert_deduplication()
+
             now = datetime.datetime.now().strftime("%H:%M:%S")
             print(f"\n[{now}] 檢查 …")
             alerts: List[str] = []
@@ -279,12 +293,26 @@ class AlertEngine:
 
             if alerts:
                 print("\n== 警報 ==")
+                unique_alerts = []
                 for a in alerts:
-                    print(a)
-                    line_push(a)  # 推送到 LINE
+                    # 檢查是否為今日已發送過的警報
+                    if a not in self.sent_alerts:
+                        unique_alerts.append(a)
+                        # 記錄此警報已於今日發送
+                        self.sent_alerts[a] = self.current_date
+                        print(a)
+                        line_push(a)  # 推送到 LINE
+                    else:
+                        print(f"[重複警報，已忽略] {a}")
+
+                if unique_alerts:
+                    print(f"已發送 {len(unique_alerts)} 則新警報")
+                else:
+                    print("所有警報今日均已發送過")
                 print("============\n")
             else:
                 print("✓ 無警報")
+
             time.sleep(CHECK_INTERVAL)
 
 
