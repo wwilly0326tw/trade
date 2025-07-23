@@ -9,7 +9,7 @@ SPY 選擇權警報系統（循環版 ‑ ibapi）
 """
 from __future__ import annotations
 
-import json, os, sys, time, threading, random, signal, datetime
+import json, os, sys, time, threading, random, signal, datetime, requests
 from dataclasses import dataclass
 from typing import Dict, Any, List
 from ibapi.client import EClient
@@ -25,13 +25,39 @@ TIMEOUT = 5.0  # 單檔行情等待秒數
 CHECK_INTERVAL = 60  # 監控輪詢秒數
 DEBUG = False  # True 時打印完整 Tick
 
+# LINE Messaging API ── 使用者提供的長期權杖（若環境變數未設則採用此值）
+CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or (
+    "jpDKXxch8e/m30Ll4irnKE5Rcwv8bNslQ0f4H4DpyMmQ4dWJNOuWDN/VUC29C7iD/"
+    "XWjDFrlRMZHAXgbdNwaUTGzpoO2sUSwSpwUonpIRTZ6TDZdsIfyz/G6Xf3RaqAsDbYti"
+    "+NKTkFPR6XHDTL5jwdB04t89/1O/w1cDnyilFU="
+)
+LINE_ENDPOINT = "https://api.line.me/v2/bot/message/broadcast"
+LINE_HEADERS = {
+    "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+    "Content-Type": "application/json",
+}
+
+
+def line_push(msg: str):
+    """以 Broadcast 方式推播文字訊息到所有已加入 Bot 的聊天室。"""
+    if not CHANNEL_ACCESS_TOKEN:
+        print("[WARN] 未設定 LINE CHANNEL TOKEN，警報只會顯示在終端機。")
+        return
+    payload = {"messages": [{"type": "text", "text": msg[:1000]}]}
+    try:
+        r = requests.post(LINE_ENDPOINT, headers=LINE_HEADERS, json=payload, timeout=5)
+        if r.status_code != 200:
+            print(f"[ERR] LINE Broadcast {r.status_code}: {r.text[:200]}")
+    except Exception as exc:
+        print(f"[ERR] LINE Broadcast 例外: {exc}")
+
 
 # ---------------- 資料類別 ----------------
 @dataclass
 class StrategyConfig:
     delta_threshold: float = 0.30
     profit_target: float = 0.50  # 50%
-    min_dte: int = 21
+    min_dte: int = 36
 
 
 @dataclass
@@ -255,6 +281,7 @@ class AlertEngine:
                 print("\n== 警報 ==")
                 for a in alerts:
                     print(a)
+                    line_push(a)  # 推送到 LINE
                 print("============\n")
             else:
                 print("✓ 無警報")
