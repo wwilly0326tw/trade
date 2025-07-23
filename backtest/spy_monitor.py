@@ -15,6 +15,9 @@ from typing import Dict, Any, List
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
+import logging
+import logging.handlers
+from pathlib import Path
 
 # ---------------- 全域設定 ----------------
 HOST = "127.0.0.1"
@@ -243,8 +246,8 @@ class AlertEngine:
             self._check_alert_deduplication()
 
             now = datetime.datetime.now().strftime("%H:%M:%S")
-            print(f"\n[{now}] 檢查 …")
-            alerts: List[str] = []
+            log.info(f"[{now}] 開始檢查合約狀態")
+            alerts = []
 
             # --- SPY 價格 / 跳空警報
             spy_snap = self.app.snapshot(self.spy_con, is_opt=False)
@@ -252,8 +255,12 @@ class AlertEngine:
             if spy_px and self.spy_prev_close:
                 gap = (spy_px - self.spy_prev_close) / self.spy_prev_close
                 if abs(gap) >= 0.03:
-                    alerts.append(f"⚡ SPY 跳空 {'↑' if gap > 0 else '↓'}{gap:.1%}")
-            print(f"SPY Px={(f'{spy_px:.2f}' if spy_px else 'NA')}")
+                    alert_msg = generate_detailed_alert(
+                        "SPY", "gap", gap, ContractConfig("SPY", "", 0, "")
+                    )
+                    alerts.append(alert_msg)
+                    log.warning(f"偵測到 SPY 跳空: {gap:.1%}")
+            log.info(f"SPY Px={(f'{spy_px:.2f}' if spy_px else 'NA')}")
 
             # --- 逐檔選擇權
             for key, c in self.cfgs.items():
@@ -262,7 +269,7 @@ class AlertEngine:
                 delta = snap.get("delta")
                 iv = snap.get("iv")
                 if price is None or delta is None:
-                    print(f"{key}: 無資料")
+                    log.warning(f"{key}: 無法取得完整資料")
                     continue
 
                 dte = self._dte(c.expiry)
@@ -270,7 +277,16 @@ class AlertEngine:
 
                 # Δ 警報
                 if delta_abs >= self.rule.delta_threshold:
-                    alerts.append(f"🚨 {key} Δ {delta_abs:.3f}")
+                    alert_msg, alert_id = generate_detailed_alert(
+                        key,
+                        "delta",
+                        delta_abs,
+                        c,
+                        {"threshold": self.rule.delta_threshold},
+                    )
+                    alerts.append((alert_msg, alert_id))
+                    log.warning(f"{key} Delta={delta_abs:.3f} 超過閾值")
+
                 # 收益率
                 base = c.premium
                 pct = (
@@ -279,39 +295,50 @@ class AlertEngine:
                     else (price - base) / base
                 )
                 if pct >= self.rule.profit_target:
-                    alerts.append(f"💰 {key} 收益 {pct:.1%}")
+                    alert_msg = generate_detailed_alert(
+                        key,
+                        "profit",
+                        pct,
+                        c,
+                        {"target": self.rule.profit_target, "price": price},
+                    )
+                    alerts.append(alert_msg)
+                    log.warning(f"{key} 收益={pct:.1%} 已達目標")
+
                 # DTE
                 if dte <= self.rule.min_dte:
-                    alerts.append(f"📅 {key} DTE {dte}")
+                    alert_msg = generate_detailed_alert(
+                        key, "dte", dte, c, {"min_dte": self.rule.min_dte}
+                    )
+                    alerts.append(alert_msg)
+                    log.warning(f"{key} DTE={dte} 低於閾值")
 
+                # 記錄詳細資訊
                 pct_str = f"{pct:+.1%}"
                 delta_diff = f"{delta_abs - abs(c.delta):+.3f}"
                 iv_str = f"{iv:.4f}" if iv else "NA"
-                print(
+                log.info(
                     f"{key}: Px={price:.2f} ({pct_str}) Δ={delta_abs:.3f} (ΔΔ={delta_diff}) IV={iv_str} DTE={dte}"
                 )
 
             if alerts:
-                print("\n== 警報 ==")
+                log.info("== 觸發警報 ==")
                 unique_alerts = []
-                for a in alerts:
-                    # 檢查是否為今日已發送過的警報
-                    if a not in self.sent_alerts:
-                        unique_alerts.append(a)
-                        # 記錄此警報已於今日發送
-                        self.sent_alerts[a] = self.current_date
-                        print(a)
-                        line_push(a)  # 推送到 LINE
+                for alert_msg, alert_id in alerts:
+                    if alert_id not in self.sent_alerts:
+                        unique_alerts.append(alert_msg)
+                        self.sent_alerts[alert_id] = self.current_date
+                        log.info(f"發送警報: {alert_msg[:50]}...")
+                        line_push(alert_msg)
                     else:
-                        print(f"[重複警報，已忽略] {a}")
+                        log.info(f"[重複警報，已忽略] {alert_msg[:50]}...")
 
                 if unique_alerts:
-                    print(f"已發送 {len(unique_alerts)} 則新警報")
+                    log.info(f"已發送 {len(unique_alerts)} 則新警報")
                 else:
-                    print("所有警報今日均已發送過")
-                print("============\n")
+                    log.info("所有警報今日均已發送過")
             else:
-                print("✓ 無警報")
+                log.info("✓ 無警報")
 
             time.sleep(CHECK_INTERVAL)
 
@@ -320,15 +347,20 @@ class AlertEngine:
 
 
 def main():
+    # 設置日誌系統
+    global log
+    log = setup_logging()
+
+    log.info("SPY 選擇權監控系統啟動")
     cfgs = ConfigManager().load()
-    print(f"讀取 {len(cfgs)} 檔合約 → 連線 {HOST}:{PORT}")
+    log.info(f"讀取 {len(cfgs)} 檔合約 → 連線 {HOST}:{PORT}")
 
     # 連線並開啟事件迴圈
     app = IBApp()
     app.connect(HOST, PORT, CID)
     threading.Thread(target=app.run, daemon=True).start()
     if not app.ready.wait(5):
-        print("握手逾時，請確認 TWS/Gateway")
+        log.error("握手逾時，請確認 TWS/Gateway")
         return
 
     # 建立警報引擎
@@ -338,7 +370,7 @@ def main():
 
     # 安全中斷
     def shutdown(sig, _):
-        print("\\n收到終止信號，正在斷線 …")
+        log.info("收到終止信號，正在斷線...")
         app.disconnect()
         sys.exit(0)
 
@@ -350,6 +382,95 @@ def main():
         eng.loop()
     finally:
         app.disconnect()
+
+
+# 設置日誌系統（在 main 函數開頭）
+def setup_logging():
+    """設置日誌系統，每兩天輪換一次檔案。"""
+    # 確保日誌目錄存在
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+
+    # 主要日誌設置
+    logger = logging.getLogger("spy_monitor")
+    logger.setLevel(logging.INFO)
+
+    # 檔案處理器 - 每兩天輪換一次
+    log_file = log_dir / "spy_monitor.log"
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        log_file, when="D", interval=2, backupCount=10, encoding="utf-8"
+    )
+
+    # 終端機處理器
+    console_handler = logging.StreamHandler()
+
+    # 日誌格式
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+
+    # 添加處理器
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    # 設置全域變數，方便其他模組使用
+    global log
+    log = logger
+
+    log.info("日誌系統已初始化，檔案將每兩天輪換一次")
+    return logger
+
+
+# Function to generate more detailed alert messages
+def generate_detailed_alert(
+    key: str,
+    alert_type: str,
+    value: float,
+    contract: ContractConfig,
+    extra_info: dict = None,
+) -> tuple[str, str]:  # Return both message and a unique ID
+    """生成詳細的警報訊息，包含觸發原因和建議動作。"""
+    extra_info = extra_info or {}
+    current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+
+    # 基本訊息格式
+    if alert_type == "delta":
+        emoji = "🚨"
+        detail = (
+            f"{key} Delta={value:.3f} 已超過閾值 {extra_info.get('threshold', 0.3):.2f}"
+        )
+        action = f"建議關注 {contract.symbol} {contract.strike}{'P' if contract.right=='PUT' else 'C'} 風險增加"
+
+    elif alert_type == "profit":
+        emoji = "💰"
+        detail = (
+            f"{key} 收益={value:.1%} 已達目標 {extra_info.get('target', 0.5):.1%}"
+            f" ({contract.action} {contract.premium:.2f}→{extra_info.get('price', 0):.2f})"
+        )
+        action = f"可考慮{'買回' if contract.action=='SELL' else '賣出'}平倉獲利"
+
+    elif alert_type == "dte":
+        emoji = "📅"
+        detail = f"{key} 剩餘天數={value}天 低於設定 {extra_info.get('min_dte', 36)}天"
+        action = "注意時間價值加速衰減，評估是否調整部位"
+
+    elif alert_type == "gap":
+        emoji = "⚡"
+        direction = "上漲" if value > 0 else "下跌"
+        detail = f"SPY {direction} {abs(value):.1%}，大幅跳空"
+        action = (
+            f"請密切關注市場波動，{'PUT' if value > 0 else 'CALL'}選擇權可能受影響較大"
+        )
+
+    # 組合完整訊息
+    full_message = f"{emoji} {current_date}\n" f"{detail}\n" f"{action}"
+
+    # Create a unique identifier for this specific alert
+    unique_id = f"{alert_type}_{key}_{datetime.datetime.now().strftime('%Y%m%d')}"
+
+    return full_message, unique_id
 
 
 if __name__ == "__main__":
