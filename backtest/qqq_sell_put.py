@@ -280,59 +280,59 @@ def backtest_qqq_put_income_strategy(
 
 if __name__ == "__main__":
     # Run the backtest with specified parameters
-    start_date = "2024-01-01"
+    start_date = "2020-01-01"
     end_date = "2025-12-31"
     test_data = [
         {
             "initial_capital": 100000.0,
             "start_date": start_date,
             "end_date": end_date,
-            "entry_drop_threshold": -0.16,
-            "exit_rebound_threshold": 0.10,
+            "entry_drop_threshold": -0.06,
+            "exit_rebound_threshold": 0.09,
             "premium_per_put_contract": 292.0,
             "put_strike_percentage_below_spot": 0.06,
             "days_to_expiration": 30,
         },
-        # {
-        #     "initial_capital": 100000.0,
-        #     "start_date": start_date,
-        #     "end_date": end_date,
-        #     "entry_drop_threshold": -0.07,
-        #     "exit_rebound_threshold": 0.09,
-        #     "premium_per_put_contract": 246.0,
-        #     "put_strike_percentage_below_spot": 0.07,
-        #     "days_to_expiration": 30,
-        # },
-        # {
-        #     "initial_capital": 100000.0,
-        #     "start_date": start_date,
-        #     "end_date": end_date,
-        #     "entry_drop_threshold": -0.05,
-        #     "exit_rebound_threshold": 0.09,
-        #     "premium_per_put_contract": 312.0,
-        #     "put_strike_percentage_below_spot": 0.05,
-        #     "days_to_expiration": 30,
-        # },
-        # {
-        #     "initial_capital": 100000.0,
-        #     "start_date": start_date,
-        #     "end_date": end_date,
-        #     "entry_drop_threshold": -0.06,
-        #     "exit_rebound_threshold": 0.09,
-        #     "premium_per_put_contract": 303.0,
-        #     "put_strike_percentage_below_spot": 0.06,
-        #     "days_to_expiration": 7,
-        # },
-        # {
-        #     "initial_capital": 100000.0,
-        #     "start_date": start_date,
-        #     "end_date": end_date,
-        #     "entry_drop_threshold": -0.0295,
-        #     "exit_rebound_threshold": 0.09,
-        #     "premium_per_put_contract": 128.0,
-        #     "put_strike_percentage_below_spot": 0.0295,
-        #     "days_to_expiration": 7,
-        # },
+        {
+            "initial_capital": 100000.0,
+            "start_date": start_date,
+            "end_date": end_date,
+            "entry_drop_threshold": -0.07,
+            "exit_rebound_threshold": 0.09,
+            "premium_per_put_contract": 246.0,
+            "put_strike_percentage_below_spot": 0.07,
+            "days_to_expiration": 30,
+        },
+        {
+            "initial_capital": 100000.0,
+            "start_date": start_date,
+            "end_date": end_date,
+            "entry_drop_threshold": -0.05,
+            "exit_rebound_threshold": 0.09,
+            "premium_per_put_contract": 312.0,
+            "put_strike_percentage_below_spot": 0.05,
+            "days_to_expiration": 30,
+        },
+        {
+            "initial_capital": 100000.0,
+            "start_date": start_date,
+            "end_date": end_date,
+            "entry_drop_threshold": -0.06,
+            "exit_rebound_threshold": 0.09,
+            "premium_per_put_contract": 303.0,
+            "put_strike_percentage_below_spot": 0.06,
+            "days_to_expiration": 7,
+        },
+        {
+            "initial_capital": 100000.0,
+            "start_date": start_date,
+            "end_date": end_date,
+            "entry_drop_threshold": -0.0295,
+            "exit_rebound_threshold": 0.09,
+            "premium_per_put_contract": 128.0,
+            "put_strike_percentage_below_spot": 0.0295,
+            "days_to_expiration": 7,
+        },
     ]
     for test in test_data:
         final_twrr, final_capital_value, chronological_log = (

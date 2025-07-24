@@ -715,7 +715,7 @@ class SPYOptionsMonitor:
 
         return alerts
 
-    def run_monitor(self, config: StrategyConfig, check_interval=60):
+    def run_monitor(self, config: StrategyConfig, check_interval=10):
         """運行監控"""
         print(f"\n=== 開始監控 (每{check_interval}秒檢查一次) ===")
 
