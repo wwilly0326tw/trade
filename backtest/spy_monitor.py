@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import json, os, sys, time, threading, random, signal, datetime, requests
 from dataclasses import dataclass
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
-from ibapi.contract import Contract
+from ibapi.contract import Contract, ContractDetails
+from ibapi.common import BarData
 import logging
 import logging.handlers
 from pathlib import Path
+from collections import deque
+import pytz
 
 # ---------------- 全域設定 ----------------
 HOST = "127.0.0.1"
@@ -108,6 +111,19 @@ class IBApp(EWrapper, EClient):
         self.req_id = 1
         self.tickers: Dict[int, Dict[str, Any]] = {}
 
+        # 用於儲存市場狀態信息
+        self.market_status = {"is_open": False, "next_open": None, "last_check": None}
+        self.contract_details_queue = deque()
+        self.contract_details_available = threading.Event()
+        self.current_time_queue = deque()
+        self.current_time_available = threading.Event()
+        self.historical_data_queue = deque()
+        self.historical_data_available = threading.Event()
+        self.historical_data_end_available = threading.Event()
+
+        # 美東時區
+        self.us_eastern = pytz.timezone("US/Eastern")
+
     # --- 握手完成
     def nextValidId(self, oid: int):
         self.req_id = max(self.req_id, oid)
@@ -117,6 +133,24 @@ class IBApp(EWrapper, EClient):
         if code in (2104, 2106, 2158):  # 市場資料伺服器通知
             return
         print(f"ERR {code}: {msg}")
+
+    # --- 市場狀態相關回調
+    def contractDetails(self, reqId, details: ContractDetails):
+        self.contract_details_queue.append(details)
+
+    def contractDetailsEnd(self, reqId):
+        self.contract_details_available.set()
+
+    def currentTime(self, server_time):
+        self.current_time_queue.append(server_time)
+        self.current_time_available.set()
+
+    def historicalData(self, reqId, bar: BarData):
+        self.historical_data_queue.append(bar)
+
+    def historicalDataEnd(self, reqId, start, end):
+        self.historical_data_available.set()
+        self.historical_data_end_available.set()
 
     # --- Tick 處理
     FIELD_MAP = {
@@ -171,6 +205,7 @@ class IBApp(EWrapper, EClient):
 
     # --- 單檔 Snapshot
     def snapshot(self, con: Contract, is_opt: bool) -> Dict[str, Any]:
+        """從 IB 取得單一合約市場快照"""
         rid = self.req_id
         self.req_id += 1
         tick_list = TICK_LIST_OPT if is_opt else ""
@@ -196,6 +231,252 @@ class IBApp(EWrapper, EClient):
             "close": close,
         }
 
+    # --- 市場狀態檢查
+    def get_contract_trading_hours(self, contract: Contract) -> Optional[str]:
+        """取得合約的交易時間"""
+        self.contract_details_available.clear()
+        self.contract_details_queue.clear()
+
+        req_id = self.req_id
+        self.req_id += 1
+        self.reqContractDetails(req_id, contract)
+
+        if not self.contract_details_available.wait(10):
+            return None
+
+        if not self.contract_details_queue:
+            return None
+
+        details = self.contract_details_queue[0]
+        return details.tradingHours
+
+    def get_server_time(self) -> Optional[datetime.datetime]:
+        """取得 IB 伺服器時間"""
+        self.current_time_available.clear()
+        self.current_time_queue.clear()
+
+        self.reqCurrentTime()
+
+        if not self.current_time_available.wait(5):
+            return None
+
+        if not self.current_time_queue:
+            return None
+
+        # IB 返回的是 UTC 時間戳
+        timestamp = self.current_time_queue.popleft()
+        server_time = datetime.datetime.fromtimestamp(timestamp, tz=pytz.UTC)
+        return server_time
+
+    def check_recent_trades(self, symbol: str = "SPY") -> bool:
+        """檢查是否有最近的交易資料來確定市場是否開盤"""
+        self.historical_data_available.clear()
+        self.historical_data_end_available.clear()
+        self.historical_data_queue.clear()
+
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+
+        req_id = self.req_id
+        self.req_id += 1
+
+        # 請求最近 5 分鐘的一分鐘 K 線
+        end_time = ""  # 空字符串表示當前時間
+        duration = "300 S"  # 5 分鐘
+        bar_size = "1 min"
+        self.reqHistoricalData(
+            req_id, contract, end_time, duration, bar_size, "TRADES", 1, 1, False, []
+        )
+
+        if not self.historical_data_end_available.wait(10):
+            return False
+
+        # 檢查是否有資料
+        if not self.historical_data_queue:
+            return False
+
+        # 取最近一筆資料看成交量
+        recent_bar = self.historical_data_queue[-1]
+        return recent_bar.volume > 0
+
+    def is_market_open(self) -> Dict[str, Any]:
+        """綜合判斷市場是否開盤，並返回市場狀態信息"""
+        # 最多每分鐘檢查一次，避免過度 API 請求
+        now = datetime.datetime.now()
+        if (
+            self.market_status["last_check"]
+            and (now - self.market_status["last_check"]).total_seconds() < 60
+        ):
+            return self.market_status
+
+        self.market_status["last_check"] = now
+
+        # 1. 獲取伺服器時間
+        server_time = self.get_server_time()
+        if not server_time:
+            log.warning("無法獲取伺服器時間")
+            self.market_status["is_open"] = False
+            return self.market_status
+
+        # 轉換到美東時間
+        et_time = server_time.astimezone(self.us_eastern)
+
+        # 2. 檢查是否為週末
+        if et_time.weekday() >= 5:  # 5=週六, 6=週日
+            log.info(f"今天是週{et_time.weekday()+1}，市場休市")
+            self.market_status["is_open"] = False
+            self._calculate_next_trading_day(et_time)
+            return self.market_status
+
+        # 3. 獲取 SPY 交易時間
+        spy_contract = Contract()
+        spy_contract.symbol = "SPY"
+        spy_contract.secType = "STK"
+        spy_contract.exchange = "SMART"
+        spy_contract.currency = "USD"
+
+        trading_hours = self.get_contract_trading_hours(spy_contract)
+        if not trading_hours:
+            log.warning("無法獲取交易時間信息")
+            # 4. 退而求其次，檢查是否有最近成交
+            has_recent_trades = self.check_recent_trades()
+            self.market_status["is_open"] = has_recent_trades
+            if not has_recent_trades:
+                self._calculate_next_trading_day(et_time)
+            return self.market_status
+
+        # 解析交易時間
+        self.market_status["is_open"] = self._parse_trading_hours(
+            trading_hours, et_time
+        )
+        if not self.market_status["is_open"]:
+            self._calculate_next_trading_day(et_time)
+
+        return self.market_status
+
+    def _parse_trading_hours(
+        self, trading_hours: str, current_time: datetime.datetime
+    ) -> bool:
+        """解析 IB 返回的交易時間字符串，判斷當前是否在交易時段"""
+        try:
+            # 範例：20250724:0930-1600;20250725:0930-1600
+            today_str = current_time.strftime("%Y%m%d")
+
+            # 尋找今天的交易時段
+            segments = trading_hours.split(";")
+            for segment in segments:
+                if not segment:
+                    continue
+
+                parts = segment.split(":")
+                if len(parts) != 2:
+                    continue
+
+                date_str, hours = parts
+                if date_str != today_str:
+                    continue
+
+                # 找到今天的時段
+                time_ranges = hours.split(",")
+                for time_range in time_ranges:
+                    if "-" not in time_range:
+                        continue
+
+                    start_str, end_str = time_range.split("-")
+
+                    # 解析時間
+                    start_hour = int(start_str[0:2])
+                    start_minute = int(start_str[2:4])
+                    end_hour = int(end_str[0:2])
+                    end_minute = int(end_str[2:4])
+
+                    # 創建時間對象
+                    start_time = current_time.replace(
+                        hour=start_hour, minute=start_minute, second=0, microsecond=0
+                    )
+                    end_time = current_time.replace(
+                        hour=end_hour, minute=end_minute, second=0, microsecond=0
+                    )
+
+                    # 檢查當前時間是否在範圍內
+                    if start_time <= current_time < end_time:
+                        return True
+
+            return False
+        except Exception as e:
+            log.error(f"解析交易時間時發生錯誤: {e}")
+            return False
+
+    def _calculate_next_trading_day(self, current_time: datetime.datetime) -> None:
+        """計算下一個交易日的開盤時間"""
+        try:
+            # 以當前時間為基礎，向後找 10 天，找到第一個有交易時段的日期
+            test_date = current_time
+            for _ in range(10):  # 往後查找 10 天
+                test_date = test_date + datetime.timedelta(days=1)
+
+                # 跳過週末
+                if test_date.weekday() >= 5:
+                    continue
+
+                test_contract = Contract()
+                test_contract.symbol = "SPY"
+                test_contract.secType = "STK"
+                test_contract.exchange = "SMART"
+                test_contract.currency = "USD"
+
+                trading_hours = self.get_contract_trading_hours(test_contract)
+                if not trading_hours:
+                    continue
+
+                # 查找該日期的開盤時間
+                test_date_str = test_date.strftime("%Y%m%d")
+                segments = trading_hours.split(";")
+
+                for segment in segments:
+                    if not segment:
+                        continue
+
+                    parts = segment.split(":")
+                    if len(parts) != 2:
+                        continue
+
+                    date_str, hours = parts
+                    if date_str != test_date_str:
+                        continue
+
+                    # 找到下一個交易日
+                    time_ranges = hours.split(",")
+                    for time_range in time_ranges:
+                        if "-" not in time_range:
+                            continue
+
+                        start_str = time_range.split("-")[0]
+
+                        # 解析時間
+                        start_hour = int(start_str[0:2])
+                        start_minute = int(start_str[2:4])
+
+                        # 設定開盤時間
+                        market_open = test_date.replace(
+                            hour=start_hour,
+                            minute=start_minute,
+                            second=0,
+                            microsecond=0,
+                        )
+                        self.market_status["next_open"] = market_open
+                        return
+
+            # 如果找不到，設置為 None
+            self.market_status["next_open"] = None
+
+        except Exception as e:
+            log.error(f"計算下一個交易日時發生錯誤: {e}")
+            self.market_status["next_open"] = None
+
 
 # ---------------- 警報引擎 ----------------
 class AlertEngine:
@@ -206,6 +487,7 @@ class AlertEngine:
         self.cfgs = cfgs
         self.rule = rule
         self.init_price: Dict[str, float] = {}
+
         # SPY 股票合約
         self.spy_con = Contract()
         self.spy_con.symbol = "SPY"
@@ -213,37 +495,109 @@ class AlertEngine:
         self.spy_con.exchange = "SMART"
         self.spy_con.currency = "USD"
         self.spy_prev_close: float | None = None
+
         # 記錄已發送的警報及發送日期
         self.sent_alerts: Dict[str, datetime.date] = {}
-        self.current_date = datetime.date.today()
+        self.trading_date = datetime.date.today()
+        self.market_closed_notified = False
+        self.last_market_status_check = datetime.datetime.min
 
     def _dte(self, expiry: str) -> int:
         expire = datetime.datetime.strptime(expiry, "%Y%m%d").date()
         return (expire - datetime.date.today()).days
 
     def first_snap(self):
-        print("首次快照 …")
+        log.info("獲取首次快照資料 ...")
+
+        # 等待市場開盤
+        self._wait_for_market_open()
+
         # 1️⃣ 記錄每檔 premium
         for k, c in self.cfgs.items():
             self.init_price[k] = c.premium
-            print(f"{k} premium = {c.premium}")
+            log.info(f"{k} premium = {c.premium}")
+
         # 2️⃣ 取得昨日收盤
         snap = self.app.snapshot(self.spy_con, is_opt=False)
         self.spy_prev_close = snap.get("close") or snap.get("price")
-        print(f"SPY 昨收 {self.spy_prev_close}")
+        log.info(f"SPY 昨收 {self.spy_prev_close}")
 
-    def _check_alert_deduplication(self):
-        """檢查是否需要重置今日警報紀錄（日期變更時）"""
-        today = datetime.date.today()
-        if today > self.current_date:
-            print(f"日期變更: {self.current_date} → {today}，重置警報紀錄")
-            self.sent_alerts.clear()
-            self.current_date = today
+    def _wait_for_market_open(self) -> None:
+        """在系統啟動時如果市場尚未開盤，等待開盤"""
+        market_status = self.app.is_market_open()
+
+        if market_status["is_open"]:
+            log.info("市場已開盤，開始監控")
+            return
+
+        next_open = market_status["next_open"]
+        if next_open:
+            wait_seconds = (
+                next_open
+                - datetime.datetime.now(pytz.UTC).astimezone(self.app.us_eastern)
+            ).total_seconds()
+            if wait_seconds > 0:
+                log.info(
+                    f"市場尚未開盤，等待開盤時間: {next_open.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                )
+                log.info(f"等待約 {wait_seconds/60:.1f} 分鐘...")
+
+                # 如果開盤時間很遠，先休眠一段時間再檢查
+                sleep_time = min(wait_seconds, 300)  # 最多休眠 5 分鐘
+                time.sleep(sleep_time)
+                self._wait_for_market_open()  # 遞迴檢查
+            else:
+                log.info("市場即將開盤，等待 30 秒確認開盤狀態...")
+                time.sleep(30)  # 等待 30 秒確認開盤
+                self._wait_for_market_open()  # 遞迴檢查
+        else:
+            log.warning("無法確定下次開盤時間，假設市場已開盤")
+
+    def _check_market_status(self) -> bool:
+        """檢查市場狀態，返回市場是否開盤"""
+        # 限制檢查頻率
+        now = datetime.datetime.now()
+        if (
+            now - self.last_market_status_check
+        ).total_seconds() < 300:  # 5分鐘內不重複檢查
+            return self.app.market_status["is_open"]
+
+        self.last_market_status_check = now
+        market_status = self.app.is_market_open()
+
+        # 檢查交易日是否改變
+        if market_status["is_open"]:
+            current_date = datetime.datetime.now().date()
+            if current_date != self.trading_date:
+                log.info(f"交易日變更: {self.trading_date} → {current_date}")
+                self.sent_alerts.clear()  # 清空已發送的警報
+                self.trading_date = current_date
+                self.market_closed_notified = False
+
+        if not market_status["is_open"] and not self.market_closed_notified:
+            next_open = market_status["next_open"]
+            if next_open:
+                log.info(
+                    f"市場已休市，下次開盤時間: {next_open.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                )
+            else:
+                log.info("市場已休市，無法確定下次開盤時間")
+            self.market_closed_notified = True
+
+        return market_status["is_open"]
 
     def loop(self):
         while True:
-            # 檢查是否需要重置警報紀錄（新的一天）
-            self._check_alert_deduplication()
+            # 檢查市場狀態
+            is_market_open = self._check_market_status()
+
+            if not is_market_open:
+                # 休市時降低檢查頻率
+                time.sleep(CHECK_INTERVAL * 5)
+                continue
+
+            # 重置通知標記，因為已進入交易時段
+            self.market_closed_notified = False
 
             now = datetime.datetime.now().strftime("%H:%M:%S")
             log.info(f"[{now}] 開始檢查合約狀態")
@@ -255,10 +609,10 @@ class AlertEngine:
             if spy_px and self.spy_prev_close:
                 gap = (spy_px - self.spy_prev_close) / self.spy_prev_close
                 if abs(gap) >= 0.03:
-                    alert_msg = generate_detailed_alert(
+                    alert_msg, alert_id = generate_detailed_alert(
                         "SPY", "gap", gap, ContractConfig("SPY", "", 0, "")
                     )
-                    alerts.append(alert_msg)
+                    alerts.append((alert_msg, alert_id))
                     log.warning(f"偵測到 SPY 跳空: {gap:.1%}")
             log.info(f"SPY Px={(f'{spy_px:.2f}' if spy_px else 'NA')}")
 
@@ -295,22 +649,22 @@ class AlertEngine:
                     else (price - base) / base
                 )
                 if pct >= self.rule.profit_target:
-                    alert_msg = generate_detailed_alert(
+                    alert_msg, alert_id = generate_detailed_alert(
                         key,
                         "profit",
                         pct,
                         c,
                         {"target": self.rule.profit_target, "price": price},
                     )
-                    alerts.append(alert_msg)
+                    alerts.append((alert_msg, alert_id))
                     log.warning(f"{key} 收益={pct:.1%} 已達目標")
 
                 # DTE
                 if dte <= self.rule.min_dte:
-                    alert_msg = generate_detailed_alert(
+                    alert_msg, alert_id = generate_detailed_alert(
                         key, "dte", dte, c, {"min_dte": self.rule.min_dte}
                     )
-                    alerts.append(alert_msg)
+                    alerts.append((alert_msg, alert_id))
                     log.warning(f"{key} DTE={dte} 低於閾值")
 
                 # 記錄詳細資訊
@@ -327,7 +681,7 @@ class AlertEngine:
                 for alert_msg, alert_id in alerts:
                     if alert_id not in self.sent_alerts:
                         unique_alerts.append(alert_msg)
-                        self.sent_alerts[alert_id] = self.current_date
+                        self.sent_alerts[alert_id] = self.trading_date
                         log.info(f"發送警報: {alert_msg[:50]}...")
                         line_push(alert_msg)
                     else:
@@ -344,8 +698,6 @@ class AlertEngine:
 
 
 # ---------------- Main ----------------
-
-
 def main():
     # 設置日誌系統
     global log
@@ -384,7 +736,7 @@ def main():
         app.disconnect()
 
 
-# 設置日誌系統（在 main 函數開頭）
+# 設置日誌系統
 def setup_logging():
     """設置日誌系統，每兩天輪換一次檔案。"""
     # 確保日誌目錄存在
@@ -415,11 +767,7 @@ def setup_logging():
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
-    # 設置全域變數，方便其他模組使用
-    global log
-    log = logger
-
-    log.info("日誌系統已初始化，檔案將每兩天輪換一次")
+    logger.info("日誌系統已初始化，檔案將每兩天輪換一次")
     return logger
 
 
@@ -467,8 +815,9 @@ def generate_detailed_alert(
     # 組合完整訊息
     full_message = f"{emoji} {current_date}\n" f"{detail}\n" f"{action}"
 
-    # Create a unique identifier for this specific alert
-    unique_id = f"{alert_type}_{key}_{datetime.datetime.now().strftime('%Y%m%d')}"
+    # 創建每日唯一的警報識別碼
+    trading_date = datetime.datetime.now().strftime("%Y%m%d")
+    unique_id = f"{alert_type}_{key}_{trading_date}"
 
     return full_message, unique_id
 
