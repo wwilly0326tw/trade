@@ -124,6 +124,32 @@ class IBApp(EWrapper, EClient):
         # 美東時區
         self.us_eastern = pytz.timezone("US/Eastern")
 
+    # ---------------- 盤中判斷 ----------------
+    def is_regular_market_open(self) -> bool:
+        """僅判斷美股*正規時段* (09:30-16:00 ET, 周一至周五) 是否開市。
+
+        盤前 (04:00-09:30) 與盤後 (16:00-20:00) 將視為休市，
+        以避免在延長時段抓取 SPY 選擇權無效或停牌的行情資料。"""
+
+        server_time = self.get_server_time()
+        if not server_time:
+            # 若無法取得伺服器時間，保守視為休市
+            return False
+
+        et_time = server_time.astimezone(self.us_eastern)
+
+        # 週末為休市
+        if et_time.weekday() >= 5:
+            return False
+
+        t = et_time.time()
+
+        market_open = (t >= datetime.time(hour=9, minute=30)) and (
+            t < datetime.time(hour=16, minute=0)
+        )
+
+        return market_open
+
     # --- 握手完成
     def nextValidId(self, oid: int):
         self.req_id = max(self.req_id, oid)
@@ -524,34 +550,55 @@ class AlertEngine:
 
     def _wait_for_market_open(self) -> None:
         """在系統啟動時如果市場尚未開盤，等待開盤"""
-        market_status = self.app.is_market_open()
-
-        if market_status["is_open"]:
-            log.info("市場已開盤，開始監控")
+        # 若尚未到正規交易時段，則等待至 09:30 ET 再啟動
+        if self.app.is_regular_market_open():
+            log.info("市場已開盤 (正規時段)，開始監控")
             return
 
-        next_open = market_status["next_open"]
-        if next_open:
-            wait_seconds = (
-                next_open
-                - datetime.datetime.now(pytz.UTC).astimezone(self.app.us_eastern)
-            ).total_seconds()
-            if wait_seconds > 0:
-                log.info(
-                    f"市場尚未開盤，等待開盤時間: {next_open.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-                )
-                log.info(f"等待約 {wait_seconds/60:.1f} 分鐘...")
+        # 計算下一次正規開盤時間
+        next_open = self._next_regular_open_time()
 
-                # 如果開盤時間很遠，先休眠一段時間再檢查
-                sleep_time = min(wait_seconds, 300)  # 最多休眠 5 分鐘
-                time.sleep(sleep_time)
-                self._wait_for_market_open()  # 遞迴檢查
-            else:
-                log.info("市場即將開盤，等待 30 秒確認開盤狀態...")
-                time.sleep(30)  # 等待 30 秒確認開盤
-                self._wait_for_market_open()  # 遞迴檢查
+        wait_seconds = (
+            next_open - datetime.datetime.now(pytz.UTC).astimezone(self.app.us_eastern)
+        ).total_seconds()
+
+        if wait_seconds > 0:
+            log.info(
+                f"市場尚未開盤，等待開盤時間: {next_open.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+            )
+            log.info(f"等待約 {wait_seconds/60:.1f} 分鐘...")
+
+            # 如果開盤時間很遠，先休眠一段時間再檢查
+            sleep_time = min(wait_seconds, 300)  # 最多休眠 5 分鐘
+            time.sleep(sleep_time)
+            self._wait_for_market_open()  # 遞迴檢查
         else:
-            log.warning("無法確定下次開盤時間，假設市場已開盤")
+            # 離開盤僅剩不到 1 分鐘，頻繁檢查
+            log.info("市場即將開盤，等待 30 秒確認開盤狀態...")
+            time.sleep(30)
+            self._wait_for_market_open()
+
+    def _next_regular_open_time(self) -> datetime.datetime:
+        """返回下一個正規交易日 09:30 ET 的 datetime (帶時區)。"""
+        server_time = self.app.get_server_time()
+        if server_time:
+            et_now = server_time.astimezone(self.app.us_eastern)
+        else:
+            # 退而取本地 UTC → ET，較不精準但足矣等待
+            et_now = datetime.datetime.now(pytz.UTC).astimezone(self.app.us_eastern)
+
+        # 若今日尚未開盤且為平日
+        today_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
+        if et_now.weekday() < 5 and et_now < today_open:
+            return today_open
+
+        # 否則尋找下一個平日
+        next_day = et_now + datetime.timedelta(days=1)
+        while next_day.weekday() >= 5:  # 跳過週末
+            next_day += datetime.timedelta(days=1)
+
+        next_open = next_day.replace(hour=9, minute=30, second=0, microsecond=0)
+        return next_open
 
     def _check_market_status(self) -> bool:
         """檢查市場狀態，返回市場是否開盤"""
@@ -563,7 +610,16 @@ class AlertEngine:
             return self.app.market_status["is_open"]
 
         self.last_market_status_check = now
+
+        # 先取得 IB 判斷的市場狀態 (可能包含盤前/盤後)
         market_status = self.app.is_market_open()
+
+        # 只取正規時段 09:30–16:00 的開盤狀態
+        regular_open = self.app.is_regular_market_open()
+        market_status["is_open"] = regular_open
+        # 重新計算下一次正規開盤時間，便於日誌輸出
+        if not regular_open:
+            market_status["next_open"] = self._next_regular_open_time()
 
         # 檢查交易日是否改變
         if market_status["is_open"]:
