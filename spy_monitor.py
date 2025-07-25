@@ -132,29 +132,20 @@ class IBApp(EWrapper, EClient):
 
     # ---------------- 盤中判斷 ----------------
     def is_regular_market_open(self) -> bool:
-        """僅判斷美股*正規時段* (09:30-16:00 ET, 周一至周五) 是否開市。
-
-        盤前 (04:00-09:30) 與盤後 (16:00-20:00) 將視為休市，
-        以避免在延長時段抓取 SPY 選擇權無效或停牌的行情資料。"""
-
+        """
+        僅判斷 RTH (09:30–16:00 ET, Mon–Fri)。
+        若無法取得伺服器時間，沿用快取狀態，避免誤判休市。
+        """
         server_time = self.get_server_time()
         if not server_time:
-            # 若無法取得伺服器時間，保守視為休市
+            # 沿用前次判斷結果，預設 True → 把「斷線」和「休市」分開處理
+            return self.market_status.get("is_open", True)
+
+        et = server_time.astimezone(self.us_eastern)
+        if et.weekday() >= 5:  # 週六週日
             return False
-
-        et_time = server_time.astimezone(self.us_eastern)
-
-        # 週末為休市
-        if et_time.weekday() >= 5:
-            return False
-
-        t = et_time.time()
-
-        market_open = (t >= datetime.time(hour=9, minute=30)) and (
-            t < datetime.time(hour=16, minute=0)
-        )
-
-        return market_open
+        t = et.time()
+        return datetime.time(9, 30) <= t < datetime.time(16, 0)
 
     # --- 握手完成
     def nextValidId(self, oid: int):
@@ -345,23 +336,34 @@ class IBApp(EWrapper, EClient):
         details = self.contract_details_queue[0]
         return details.tradingHours
 
-    def get_server_time(self) -> Optional[datetime.datetime]:
-        """取得 IB 伺服器時間"""
-        self.current_time_available.clear()
-        self.current_time_queue.clear()
+    _last_server_time: Optional[datetime.datetime] = None
+    _server_time_ts: float = 0.0  # epoch 秒
 
-        self.reqCurrentTime()
+    def get_server_time(
+        self, retry: int = 3, timeout: float = 5.0
+    ) -> Optional[datetime.datetime]:
+        """
+        取 IB 伺服器時間；若短暫失敗，保留最近一次成功結果，
+        並在 retry 次內重試，避免把市場誤判為休市。
+        """
+        for _ in range(retry):
+            self.current_time_available.clear()
+            self.current_time_queue.clear()
+            self.reqCurrentTime()
+            if self.current_time_available.wait(timeout):
+                ts = self.current_time_queue.popleft()
+                # 轉成 aware UTC datetime
+                dt = datetime.datetime.fromtimestamp(ts, tz=pytz.UTC)
+                # 快取
+                self._last_server_time = dt
+                self._server_time_ts = time.time()
+                return dt
+            time.sleep(0.2)  # 短暫讓出 GIL 以接收封包
 
-        if not self.current_time_available.wait(5):
-            return None
-
-        if not self.current_time_queue:
-            return None
-
-        # IB 返回的是 UTC 時間戳
-        timestamp = self.current_time_queue.popleft()
-        server_time = datetime.datetime.fromtimestamp(timestamp, tz=pytz.UTC)
-        return server_time
+        # 若連續失敗 → 回傳最近一次成功的結果（若有且 <90 秒）
+        if self._last_server_time and (time.time() - self._server_time_ts) < 90:
+            return self._last_server_time
+        return None  # 真的要回 None，讓外部決定 fallback
 
     def check_recent_trades(self, symbol: str = "SPY") -> bool:
         """檢查是否有最近的交易資料來確定市場是否開盤"""
