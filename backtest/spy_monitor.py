@@ -550,33 +550,33 @@ class AlertEngine:
 
     def _wait_for_market_open(self) -> None:
         """在系統啟動時如果市場尚未開盤，等待開盤"""
-        # 若尚未到正規交易時段，則等待至 09:30 ET 再啟動
-        if self.app.is_regular_market_open():
-            log.info("市場已開盤 (正規時段)，開始監控")
-            return
+        # 以迴圈替代遞迴，避免長時間等待導致遞迴層數過深
+        while not self.app.is_regular_market_open():
+            next_open = self._next_regular_open_time()
 
-        # 計算下一次正規開盤時間
-        next_open = self._next_regular_open_time()
+            # 若無法取得下一次開盤時間，預設 5 分鐘後再次檢查
+            if not next_open:
+                log.info("無法計算下一次開盤時間，5 分鐘後重新檢查 ...")
+                time.sleep(300)
+                continue
 
-        wait_seconds = (
-            next_open - datetime.datetime.now(pytz.UTC).astimezone(self.app.us_eastern)
-        ).total_seconds()
+            # 估算距離開盤的秒數
+            now_et = datetime.datetime.now(pytz.UTC).astimezone(self.app.us_eastern)
+            wait_seconds = (next_open - now_et).total_seconds()
 
-        if wait_seconds > 0:
-            log.info(
-                f"市場尚未開盤，等待開盤時間: {next_open.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-            )
-            log.info(f"等待約 {wait_seconds/60:.1f} 分鐘...")
+            if wait_seconds <= 60:
+                # 開盤在即，縮短檢查間隔
+                log.info("市場即將開盤，30 秒後再次確認 ...")
+                time.sleep(30)
+            else:
+                log.info(
+                    f"市場尚未開盤，預計開盤時間: {next_open.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                )
+                log.info(f"將在 {min(wait_seconds/60, 5):.1f} 分鐘後重新檢查 ...")
+                # 最多休眠 5 分鐘，避免長時間阻塞
+                time.sleep(min(wait_seconds, 300))
 
-            # 如果開盤時間很遠，先休眠一段時間再檢查
-            sleep_time = min(wait_seconds, 300)  # 最多休眠 5 分鐘
-            time.sleep(sleep_time)
-            self._wait_for_market_open()  # 遞迴檢查
-        else:
-            # 離開盤僅剩不到 1 分鐘，頻繁檢查
-            log.info("市場即將開盤，等待 30 秒確認開盤狀態...")
-            time.sleep(30)
-            self._wait_for_market_open()
+        log.info("市場已開盤 (正規時段)，開始監控")
 
     def _next_regular_open_time(self) -> datetime.datetime:
         """返回下一個正規交易日 09:30 ET 的 datetime (帶時區)。"""
