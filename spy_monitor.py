@@ -455,96 +455,41 @@ class IBApp(EWrapper, EClient):
     def _parse_trading_hours(
         self, trading_hours: str, current_time: datetime.datetime
     ) -> bool:
-        _PATTERN = re.compile(
+        def _split_ranges(trading_hours: str):
+            """把 ';' 與 ',' 皆視為分段分隔，不直接丟棄含 CLOSED 的 segment"""
+
+            for seg in trading_hours.split(";"):
+                for rng in seg.split(","):
+                    yield rng.strip()
+
+        _RANGE_RE = re.compile(
             r"^(?P<sdate>\d{8}):(?P<stime>\d{4})"
             r"-(?:(?P<edate>\d{8}):)?(?P<etime>\d{4})$"
         )
         today = current_time.strftime("%Y%m%d")
-        for segment in trading_hours.split(";"):
-            if segment.endswith("CLOSED"):
+        tz = self.us_eastern  # 已在 __init__ 建立的 pytz 時區
+
+        for rng in _split_ranges(trading_hours):
+            if rng.endswith("CLOSED"):
+                continue  # 只跳過這一小段
+
+            m = _RANGE_RE.match(rng)
+            if not m or m["sdate"] != today:
                 continue
-            for rng in segment.split(","):
-                m = _PATTERN.match(rng.strip())
-                if not m or m.group("sdate") != today:
-                    continue
-                # 起訖若共用同一天，IB 新舊格式都能抓到
-                s_dt = datetime.datetime.strptime(
-                    m.group("sdate") + m.group("stime"), "%Y%m%d%H%M"
-                ).replace(tzinfo=self.us_eastern)
-                e_date = m.group("edate") or m.group("sdate")
-                e_dt = datetime.datetime.strptime(
-                    e_date + m.group("etime"), "%Y%m%d%H%M"
-                ).replace(tzinfo=self.us_eastern)
-                if s_dt <= current_time < e_dt:
-                    return True
+
+            # 正確建立 aware datetime，避免 –04:56 偏移
+            start_dt = tz.localize(
+                datetime.datetime.strptime(m["sdate"] + m["stime"], "%Y%m%d%H%M")
+            )
+            end_dt = tz.localize(
+                datetime.datetime.strptime(
+                    (m["edate"] or m["sdate"]) + m["etime"], "%Y%m%d%H%M"
+                )
+            )
+
+            if start_dt <= current_time < end_dt:
+                return True
         return False
-
-        def _calculate_next_trading_day(self, current_time: datetime.datetime) -> None:
-            """計算下一個交易日的開盤時間"""
-            try:
-                # 以當前時間為基礎，向後找 10 天，找到第一個有交易時段的日期
-                test_date = current_time
-                for _ in range(10):  # 往後查找 10 天
-                    test_date = test_date + datetime.timedelta(days=1)
-
-                    # 跳過週末
-                    if test_date.weekday() >= 5:
-                        continue
-
-                    test_contract = Contract()
-                    test_contract.symbol = "SPY"
-                    test_contract.secType = "STK"
-                    test_contract.exchange = "SMART"
-                    test_contract.currency = "USD"
-
-                    trading_hours = self.get_contract_trading_hours(test_contract)
-                    if not trading_hours:
-                        continue
-
-                    # 查找該日期的開盤時間
-                    test_date_str = test_date.strftime("%Y%m%d")
-                    segments = trading_hours.split(";")
-
-                    for segment in segments:
-                        if not segment:
-                            continue
-
-                        parts = segment.split(":")
-                        if len(parts) != 2:
-                            continue
-
-                        date_str, hours = parts
-                        if date_str != test_date_str:
-                            continue
-
-                        # 找到下一個交易日
-                        time_ranges = hours.split(",")
-                        for time_range in time_ranges:
-                            if "-" not in time_range:
-                                continue
-
-                            start_str = time_range.split("-")[0]
-
-                            # 解析時間
-                            start_hour = int(start_str[0:2])
-                            start_minute = int(start_str[2:4])
-
-                            # 設定開盤時間
-                            market_open = test_date.replace(
-                                hour=start_hour,
-                                minute=start_minute,
-                                second=0,
-                                microsecond=0,
-                            )
-                            self.market_status["next_open"] = market_open
-                            return
-
-                # 如果找不到，設置為 None
-                self.market_status["next_open"] = None
-
-            except Exception as e:
-                log.error(f"計算下一個交易日時發生錯誤: {e}")
-                self.market_status["next_open"] = None
 
 
 # ---------------- 警報引擎 ----------------
