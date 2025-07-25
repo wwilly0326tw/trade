@@ -109,7 +109,13 @@ class IBApp(EWrapper, EClient):
         EClient.__init__(self, self)
         self.ready = threading.Event()
         self.req_id = 1
+        # ───────── Market-data cache ─────────
+        # original snapshot() 以 rid 為 key 暫存一次性資料；
+        # 併發 / 長駐訂閱需要一份全域快取讓外部直接存取最新 tick。
+        # 使用兩層 mapping：  rid → tmp dict (沿用原本)，以及 key → dict 供 AlertEngine 查詢。
         self.tickers: Dict[int, Dict[str, Any]] = {}
+        self._stream_key_map: Dict[int, str] = {}
+        self._stream_data: Dict[str, Dict[str, Any]] = {}
 
         # 用於儲存市場狀態信息
         self.market_status = {"is_open": False, "next_open": None, "last_check": None}
@@ -178,6 +184,43 @@ class IBApp(EWrapper, EClient):
         self.historical_data_available.set()
         self.historical_data_end_available.set()
 
+    # ---------------- Streaming market-data ----------------
+    def subscribe(self, con: Contract, is_opt: bool, key: str) -> int:
+        """Subscribe to streaming market data for *con*, identify by *key*.
+
+        Parameters
+        ----------
+        con : Contract
+            IB contract object.
+        is_opt : bool
+            True if option contract (will request greeks via TICK_LIST_OPT).
+        key : str
+            Application-level identifier (e.g. contract symbol or dict key).
+        Returns
+        -------
+        int
+            IB ticker id assigned to this subscription.
+        """
+        rid = self.req_id
+        self.req_id += 1
+        tick_list = TICK_LIST_OPT if is_opt else ""
+
+        self._stream_key_map[rid] = key
+        self.reqMktData(rid, con, tick_list, False, False, [])
+
+        return rid
+
+    def unsubscribe(self, rid: int):
+        """Cancel an existing streaming subscription by ticker id."""
+        if rid in self._stream_key_map:
+            self.cancelMktData(rid)
+            key = self._stream_key_map.pop(rid)
+            self._stream_data.pop(key, None)
+
+    def get_stream_data(self, key: str) -> Dict[str, Any]:
+        """Return the latest cached tick dictionary for *key*."""
+        return self._stream_data.get(key, {})
+
     # --- Tick 處理
     FIELD_MAP = {
         0: "bid_size",
@@ -204,11 +247,24 @@ class IBApp(EWrapper, EClient):
         key = self.FIELD_MAP.get(field, f"p{field}")
         self.tickers.setdefault(reqId, {})[key] = price
 
+        # 更新 streaming 快取 (若此 reqId 為長駐訂閱)
+        if reqId in self._stream_key_map:
+            k = self._stream_key_map[reqId]
+            self._stream_data.setdefault(k, {})[key] = price
+
     def tickSize(self, reqId, field, size):
         self.tickers.setdefault(reqId, {})[f"size_{field}"] = size
 
+        if reqId in self._stream_key_map:
+            k = self._stream_key_map[reqId]
+            self._stream_data.setdefault(k, {})[f"size_{field}"] = size
+
     def tickGeneric(self, reqId, field, value):
         self.tickers.setdefault(reqId, {})[f"g{field}"] = value
+
+        if reqId in self._stream_key_map:
+            k = self._stream_key_map[reqId]
+            self._stream_data.setdefault(k, {})[f"g{field}"] = value
 
     # 兼容不同版本 (>= v10.19 參數增多)
     def tickOptionComputation(self, reqId, *args):
@@ -228,6 +284,19 @@ class IBApp(EWrapper, EClient):
                 "undPx": undPx,
             }
         )
+
+        if reqId in self._stream_key_map:
+            k = self._stream_key_map[reqId]
+            self._stream_data.setdefault(k, {}).update(
+                {
+                    "iv": iv,
+                    "delta": delta,
+                    "gamma": gamma,
+                    "vega": vega,
+                    "theta": theta,
+                    "undPx": undPx,
+                }
+            )
 
     # --- 單檔 Snapshot
     def snapshot(self, con: Contract, is_opt: bool) -> Dict[str, Any]:
@@ -528,6 +597,19 @@ class AlertEngine:
         self.market_closed_notified = False
         self.last_market_status_check = datetime.datetime.min
 
+        # 建立 streaming 訂閱 (一次性)
+        self._subscribe_market_data()
+
+    # ---------- Streaming helpers ----------
+    def _subscribe_market_data(self):
+        """Subscribe to streaming market data for SPY and all option contracts."""
+        # SPY 本尊
+        self.app.subscribe(self.spy_con, False, "SPY")
+
+        # 所有選擇權
+        for key, cfg in self.cfgs.items():
+            self.app.subscribe(cfg.to_ib(), True, key)
+
     def _dte(self, expiry: str) -> int:
         expire = datetime.datetime.strptime(expiry, "%Y%m%d").date()
         return (expire - datetime.date.today()).days
@@ -543,10 +625,20 @@ class AlertEngine:
             self.init_price[k] = c.premium
             log.info(f"{k} premium = {c.premium}")
 
-        # 2️⃣ 取得昨日收盤
-        snap = self.app.snapshot(self.spy_con, is_opt=False)
-        self.spy_prev_close = snap.get("close") or snap.get("price")
+        # 2️⃣ 取得昨日收盤 (從 streaming 資料)
+        self.spy_prev_close = self._wait_for_prev_close()
         log.info(f"SPY 昨收 {self.spy_prev_close}")
+
+    def _wait_for_prev_close(self, timeout: float = 10.0) -> Optional[float]:
+        """等待 streaming 資料填入昨日收盤價，最多 *timeout* 秒。"""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            data = self.app.get_stream_data("SPY")
+            close_val = data.get("prev_close") or data.get("close")
+            if close_val:
+                return close_val
+            time.sleep(0.1)
+        return None
 
     def _wait_for_market_open(self) -> None:
         """在系統啟動時如果市場尚未開盤，等待開盤"""
@@ -659,9 +751,13 @@ class AlertEngine:
             log.info(f"[{now}] 開始檢查合約狀態")
             alerts = []
 
-            # --- SPY 價格 / 跳空警報
-            spy_snap = self.app.snapshot(self.spy_con, is_opt=False)
-            spy_px = spy_snap.get("price")
+            # --- SPY 價格 / 跳空警報 (使用 streaming 快取)
+            spy_data = self.app.get_stream_data("SPY")
+            spy_px = (
+                spy_data.get("last")
+                or spy_data.get("bid")
+                or spy_data.get("ask")
+            )
             if spy_px and self.spy_prev_close:
                 gap = (spy_px - self.spy_prev_close) / self.spy_prev_close
                 if abs(gap) >= 0.03:
@@ -674,10 +770,12 @@ class AlertEngine:
 
             # --- 逐檔選擇權
             for key, c in self.cfgs.items():
-                snap = self.app.snapshot(c.to_ib(), True)
-                price = snap["price"]
-                delta = snap.get("delta")
-                iv = snap.get("iv")
+                data = self.app.get_stream_data(key)
+                price = (
+                    data.get("last") or data.get("bid") or data.get("ask")
+                )
+                delta = data.get("delta")
+                iv = data.get("iv")
                 if price is None or delta is None:
                     log.warning(f"{key}: 無法取得完整資料")
                     continue
