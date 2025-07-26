@@ -130,6 +130,20 @@ class IBApp(EWrapper, EClient):
         # 美東時區
         self.us_eastern = pytz.timezone("US/Eastern")
 
+    def _calculate_next_trading_day(self, et_now: datetime.datetime) -> None:
+        """
+        計算下一個正規交易日 09:30 ET，寫回 self.market_status['next_open']。
+        若要更精確可再解析 tradingHours/liquidHours。
+        """
+        tz = self.us_eastern
+        # 從明天開始往後找第一個非週末
+        d = et_now + datetime.timedelta(days=1)
+        while d.weekday() >= 5:  # 5=Sat, 6=Sun
+            d += datetime.timedelta(days=1)
+
+        next_open = tz.localize(datetime.datetime(d.year, d.month, d.day, 9, 30))
+        self.market_status["next_open"] = next_open
+
     # ---------------- 盤中判斷 ----------------
     def is_regular_market_open(self) -> bool:
         """
@@ -657,113 +671,119 @@ class AlertEngine:
 
     def loop(self):
         while True:
-            # 檢查市場狀態
-            is_market_open = self._check_market_status()
+            try:
+                # 檢查市場狀態
+                is_market_open = self._check_market_status()
 
-            if not is_market_open:
-                # 休市時降低檢查頻率
-                time.sleep(CHECK_INTERVAL * 5)
-                continue
-
-            # 重置通知標記，因為已進入交易時段
-            self.market_closed_notified = False
-
-            now = datetime.datetime.now().strftime("%H:%M:%S")
-            log.info(f"[{now}] 開始檢查合約狀態")
-            alerts = []
-
-            # --- SPY 價格 / 跳空警報 (使用 streaming 快取)
-            spy_data = self.app.get_stream_data("SPY")
-            spy_px = spy_data.get("last") or spy_data.get("bid") or spy_data.get("ask")
-            if spy_px and self.spy_prev_close:
-                gap = (spy_px - self.spy_prev_close) / self.spy_prev_close
-                if abs(gap) >= 0.03:
-                    alert_msg, alert_id = generate_detailed_alert(
-                        "SPY", "gap", gap, ContractConfig("SPY", "", 0, "")
-                    )
-                    alerts.append((alert_msg, alert_id))
-                    log.warning(f"偵測到 SPY 跳空: {gap:.1%}")
-            log.info(f"SPY Px={(f'{spy_px:.2f}' if spy_px else 'NA')}")
-
-            # --- 逐檔選擇權
-            for key, c in self.cfgs.items():
-                data = self.app.get_stream_data(key)
-                price = data.get("last") or data.get("bid") or data.get("ask")
-                delta = data.get("delta")
-                iv = data.get("iv")
-                if price is None or delta is None:
-                    log.warning(f"{key}: 無法取得完整資料")
+                if not is_market_open:
+                    # 休市時降低檢查頻率
+                    time.sleep(CHECK_INTERVAL * 5)
                     continue
 
-                dte = self._dte(c.expiry)
-                delta_abs = abs(delta)
+                # 重置通知標記，因為已進入交易時段
+                self.market_closed_notified = False
 
-                # Δ 警報
-                if delta_abs >= self.rule.delta_threshold:
-                    alert_msg, alert_id = generate_detailed_alert(
-                        key,
-                        "delta",
-                        delta_abs,
-                        c,
-                        {"threshold": self.rule.delta_threshold},
-                    )
-                    alerts.append((alert_msg, alert_id))
-                    log.warning(f"{key} Delta={delta_abs:.3f} 超過閾值")
+                now = datetime.datetime.now().strftime("%H:%M:%S")
+                log.info(f"[{now}] 開始檢查合約狀態")
+                alerts = []
 
-                # 收益率
-                base = c.premium
-                pct = (
-                    (base - price) / base
-                    if c.action.upper() == "SELL"
-                    else (price - base) / base
+                # --- SPY 價格 / 跳空警報 (使用 streaming 快取)
+                spy_data = self.app.get_stream_data("SPY")
+                spy_px = (
+                    spy_data.get("last") or spy_data.get("bid") or spy_data.get("ask")
                 )
-                if pct >= self.rule.profit_target:
-                    alert_msg, alert_id = generate_detailed_alert(
-                        key,
-                        "profit",
-                        pct,
-                        c,
-                        {"target": self.rule.profit_target, "price": price},
+                if spy_px and self.spy_prev_close:
+                    gap = (spy_px - self.spy_prev_close) / self.spy_prev_close
+                    if abs(gap) >= 0.03:
+                        alert_msg, alert_id = generate_detailed_alert(
+                            "SPY", "gap", gap, ContractConfig("SPY", "", 0, "")
+                        )
+                        alerts.append((alert_msg, alert_id))
+                        log.warning(f"偵測到 SPY 跳空: {gap:.1%}")
+                log.info(f"SPY Px={(f'{spy_px:.2f}' if spy_px else 'NA')}")
+
+                # --- 逐檔選擇權
+                for key, c in self.cfgs.items():
+                    data = self.app.get_stream_data(key)
+                    price = data.get("last") or data.get("bid") or data.get("ask")
+                    delta = data.get("delta")
+                    iv = data.get("iv")
+                    if price is None or delta is None:
+                        log.warning(f"{key}: 無法取得完整資料")
+                        continue
+
+                    dte = self._dte(c.expiry)
+                    delta_abs = abs(delta)
+
+                    # Δ 警報
+                    if delta_abs >= self.rule.delta_threshold:
+                        alert_msg, alert_id = generate_detailed_alert(
+                            key,
+                            "delta",
+                            delta_abs,
+                            c,
+                            {"threshold": self.rule.delta_threshold},
+                        )
+                        alerts.append((alert_msg, alert_id))
+                        log.warning(f"{key} Delta={delta_abs:.3f} 超過閾值")
+
+                    # 收益率
+                    base = c.premium
+                    pct = (
+                        (base - price) / base
+                        if c.action.upper() == "SELL"
+                        else (price - base) / base
                     )
-                    alerts.append((alert_msg, alert_id))
-                    log.warning(f"{key} 收益={pct:.1%} 已達目標")
+                    if pct >= self.rule.profit_target:
+                        alert_msg, alert_id = generate_detailed_alert(
+                            key,
+                            "profit",
+                            pct,
+                            c,
+                            {"target": self.rule.profit_target, "price": price},
+                        )
+                        alerts.append((alert_msg, alert_id))
+                        log.warning(f"{key} 收益={pct:.1%} 已達目標")
 
-                # DTE
-                if dte <= self.rule.min_dte:
-                    alert_msg, alert_id = generate_detailed_alert(
-                        key, "dte", dte, c, {"min_dte": self.rule.min_dte}
+                    # DTE
+                    if dte <= self.rule.min_dte:
+                        alert_msg, alert_id = generate_detailed_alert(
+                            key, "dte", dte, c, {"min_dte": self.rule.min_dte}
+                        )
+                        alerts.append((alert_msg, alert_id))
+                        log.warning(f"{key} DTE={dte} 低於閾值")
+
+                    # 記錄詳細資訊
+                    pct_str = f"{pct:+.1%}"
+                    delta_diff = f"{delta_abs - abs(c.delta):+.3f}"
+                    iv_str = f"{iv:.4f}" if iv else "NA"
+                    log.info(
+                        f"{key}: Px={price:.2f} ({pct_str}) Δ={delta_abs:.3f} (ΔΔ={delta_diff}) IV={iv_str} DTE={dte}"
                     )
-                    alerts.append((alert_msg, alert_id))
-                    log.warning(f"{key} DTE={dte} 低於閾值")
 
-                # 記錄詳細資訊
-                pct_str = f"{pct:+.1%}"
-                delta_diff = f"{delta_abs - abs(c.delta):+.3f}"
-                iv_str = f"{iv:.4f}" if iv else "NA"
-                log.info(
-                    f"{key}: Px={price:.2f} ({pct_str}) Δ={delta_abs:.3f} (ΔΔ={delta_diff}) IV={iv_str} DTE={dte}"
-                )
+                if alerts:
+                    log.info("== 觸發警報 ==")
+                    unique_alerts = []
+                    for alert_msg, alert_id in alerts:
+                        if alert_id not in self.sent_alerts:
+                            unique_alerts.append(alert_msg)
+                            self.sent_alerts[alert_id] = self.trading_date
+                            log.info(f"發送警報: {alert_msg[:50]}...")
+                            line_push(alert_msg)
+                        else:
+                            log.info(f"[重複警報，已忽略] {alert_msg[:50]}...")
 
-            if alerts:
-                log.info("== 觸發警報 ==")
-                unique_alerts = []
-                for alert_msg, alert_id in alerts:
-                    if alert_id not in self.sent_alerts:
-                        unique_alerts.append(alert_msg)
-                        self.sent_alerts[alert_id] = self.trading_date
-                        log.info(f"發送警報: {alert_msg[:50]}...")
-                        line_push(alert_msg)
+                    if unique_alerts:
+                        log.info(f"已發送 {len(unique_alerts)} 則新警報")
                     else:
-                        log.info(f"[重複警報，已忽略] {alert_msg[:50]}...")
-
-                if unique_alerts:
-                    log.info(f"已發送 {len(unique_alerts)} 則新警報")
+                        log.info("所有警報今日均已發送過")
                 else:
-                    log.info("所有警報今日均已發送過")
-            else:
-                log.info("✓ 無警報")
+                    log.info("✓ 無警報")
 
-            time.sleep(CHECK_INTERVAL)
+                time.sleep(CHECK_INTERVAL)
+            except:
+                log.exception("主循環發生未處理例外，60 秒後重試")
+                time.sleep(60)
 
 
 # ---------------- Main ----------------
