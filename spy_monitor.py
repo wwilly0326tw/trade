@@ -24,7 +24,7 @@ import pytz
 
 # ---------------- 全域設定 ----------------
 HOST = "127.0.0.1"
-PORT = 7496  # Paper: 7497 / 4002
+PORT = 4002  # Paper: 7497 / 4002
 CID = random.randint(1000, 9999)
 TICK_LIST_OPT = "106"  # 要求 Option Greeks (IV / Δ)
 TIMEOUT = 5.0  # 單檔行情等待秒數
@@ -413,9 +413,45 @@ class IBApp(EWrapper, EClient):
 
         # 1. 獲取伺服器時間
         server_time = self.get_server_time()
+        # -------------------------------------------------------------
+        # 無法即時取得伺服器時間 (可能只是瞬斷) 的處理策略
+        # -------------------------------------------------------------
+        # 原邏輯：只要 get_server_time() 回傳 None 便立刻判定休市。
+        # 實務上 TWS/Gateway 連線偶爾會在盤中短暫中斷（re-login、
+        # 網路 jitter 等）。若逕自把 `is_open` 轉為 False，AlertEngine
+        # 會：
+        #   1. 立即降低輪詢頻率 (×5)；
+        #   2. 推出「市場已休市」訊息；
+        #   3. 就算連線立刻恢復，也要等下一輪 (5 分鐘) 才重回正常。
+        #
+        # 為了降低誤判，我們加入「寬限期」：
+        #   ‑ 若上一筆成功的 server_time 距今 < GRACE_PERIOD 秒，
+        #     則沿用先前結果判斷市場是否仍應視為開盤。
+        #   ‑ 超過寬限期才真正宣布休市。
+        # 此舉可過濾大部分瞬斷（1∼2 分鐘），又不至於影響收盤後的判斷。
+        GRACE_PERIOD = 600  # 秒；10 分鐘
+
         if not server_time:
-            log.warning("無法獲取伺服器時間")
+            # 如果最近一次成功時間還很近，就沿用「開市中」狀態
+            if (
+                self._last_server_time
+                and (time.time() - self._server_time_ts) < GRACE_PERIOD
+                and self.market_status.get("is_open", False)
+            ):
+                log.warning(
+                    "無法獲取伺服器時間 ‑ 使用緩存判斷市場仍在交易 (grace)"
+                )
+                # 不更新 last_check，避免之後十秒內又跳進來
+                return self.market_status
+
+            # 超過寬限期 → 視為休市
+            log.warning("無法獲取伺服器時間，超過寬限期 → 視為休市")
             self.market_status["is_open"] = False
+            # 預估下一個開盤時間 (避免 None)
+            if self._last_server_time:
+                self._calculate_next_trading_day(
+                    self._last_server_time.astimezone(self.us_eastern)
+                )
             return self.market_status
 
         # 轉換到美東時間
