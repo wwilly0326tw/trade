@@ -1,0 +1,14 @@
+[Unit]
+Description=My Python Script
+
+[Service]
+ExecStart=/usr/bin/python3.12 /synosrc/ds.base/source/research/trade/spy_monitor.py
+WorkingDirectory=/synosrc/ds.base/source/research/trade
+ExecStartPre=/usr/bin/git pull
+Restart=on-failure
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

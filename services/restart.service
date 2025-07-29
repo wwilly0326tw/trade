@@ -1,0 +1,7 @@
+[Unit]
+Description=Restart My App Service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart spy-monitor.service
+
