@@ -25,7 +25,7 @@ from IBApp import IBApp
 
 # ---------------- 全域設定 ----------------
 HOST = "127.0.0.1"
-PORT = 7496  # Paper: 7497 / 4002
+PORT = 4001  # Paper: 7497 / 4002
 CID = random.randint(1000, 9999)
 TICK_LIST_OPT = "106"  # 要求 Option Greeks (IV / Δ)
 TIMEOUT = 5.0  # 單檔行情等待秒數
@@ -113,8 +113,9 @@ class AlertEngine:
         self.cfgs = cfgs
         self.rule = rule
         self.init_price: Dict[str, float] = {}
+        self.prev_closes: Dict[str, float] = {}  # 存儲各標的物昨收
 
-        # SPY 股票合約
+        # SPY 股票合約 (兼容性保留)
         self.spy_con = Contract()
         self.spy_con.symbol = "SPY"
         self.spy_con.secType = "STK"
@@ -128,22 +129,43 @@ class AlertEngine:
         self.market_closed_notified = False
         self.last_market_status_check = datetime.datetime.min
 
-        # 建立 streaming 訂閱 (一次性)
-        self._subscribe_market_data()
-
         # For position tracking
         self.last_positions_update = time.time()
         self.use_positions = True  # Flag to use positions or config
 
+        # 建立 streaming 訂閱
+        self._subscribe_market_data()
+
     # ---------- Streaming helpers ----------
     def _subscribe_market_data(self):
-        """Subscribe to streaming market data for SPY and all option contracts."""
-        # SPY 本尊
-        self.app.subscribe(self.spy_con, False, "SPY")
+        """根據合約配置訂閱市場數據，包括標的股票和選擇權"""
+        # 清理之前訂閱的數據 (可選，視 IBApp 實現而定)
+        # 需要先獲取所有唯一的標的股票
+        underlying_symbols = set()
 
-        # 所有選擇權
+        # 從合約配置中獲取所有唯一的標的股票符號
+        for key, cfg in self.cfgs.items():
+            underlying_symbols.add(cfg.symbol)
+
+        # 訂閱所有標的股票
+        for symbol in underlying_symbols:
+            stk_con = Contract()
+            stk_con.symbol = symbol
+            stk_con.secType = "STK"
+            stk_con.exchange = "SMART"
+            stk_con.currency = "USD"
+            self.app.subscribe(stk_con, False, symbol)
+            log.info(f"已訂閱 {symbol} 股票行情")
+
+        # 訂閱所有選擇權合約
+        option_count = 0
         for key, cfg in self.cfgs.items():
             self.app.subscribe(cfg.to_ib(), True, key)
+            option_count += 1
+
+        log.info(
+            f"已訂閱 {len(underlying_symbols)} 個股票和 {option_count} 個選擇權合約的市場數據"
+        )
 
     def _dte(self, expiry: str) -> int:
         expire = datetime.datetime.strptime(expiry, "%Y%m%d").date()
@@ -160,9 +182,21 @@ class AlertEngine:
             self.init_price[k] = c.premium
             log.info(f"{k} premium = {c.premium}")
 
-        # 2️⃣ 取得昨日收盤 (從 streaming 資料)
-        self.spy_prev_close = self._wait_for_prev_close()
-        log.info(f"SPY 昨收 {self.spy_prev_close}")
+        # 2️⃣ 取得所有標的物的昨日收盤
+        self.prev_closes = {}  # 用字典存儲各標的物的昨收
+
+        underlying_symbols = set(cfg.symbol for cfg in self.cfgs.values())
+
+        for symbol in underlying_symbols:
+            prev_close = self._get_underlying_prev_close(symbol)
+            if prev_close:
+                self.prev_closes[symbol] = prev_close
+                log.info(f"{symbol} 昨收 {prev_close}")
+            else:
+                log.warning(f"無法獲取 {symbol} 昨收價格")
+
+        # 向下兼容，保留 spy_prev_close 變數
+        self.spy_prev_close = self.prev_closes.get("SPY")
 
     def _wait_for_prev_close(self, timeout: float = 10.0) -> Optional[float]:
         """等待 streaming 資料填入昨日收盤價，最多 *timeout* 秒。"""
@@ -356,8 +390,26 @@ class AlertEngine:
                 # 重新訂閱所有合約的市場數據
                 self._subscribe_market_data()
                 log.info("已為所有艙位重新訂閱市場數據")
+
+                # 更新初始價格及昨收價格
+                self._update_initial_prices()
             else:
                 log.warning("艙位數據為空，保留原有配置")
+
+    def _update_initial_prices(self):
+        """更新初始價格和前收盤價格"""
+        # 更新選擇權初始價格
+        for k, c in self.cfgs.items():
+            self.init_price[k] = c.premium
+
+        # 更新標的物昨收價格
+        underlying_symbols = set(cfg.symbol for cfg in self.cfgs.values())
+        for symbol in underlying_symbols:
+            if symbol not in self.prev_closes:
+                prev_close = self._get_underlying_prev_close(symbol)
+                if prev_close:
+                    self.prev_closes[symbol] = prev_close
+                    log.info(f"更新 {symbol} 昨收價格: {prev_close}")
 
     def loop(self):
         # Initial load from positions
@@ -389,20 +441,39 @@ class AlertEngine:
                 log.info(f"[{now}] 開始檢查合約狀態")
                 alerts = []
 
-                # --- SPY 價格 / 跳空警報 (使用 streaming 快取)
+                # --- 所有標的股票價格 / 跳空警報
+                underlying_symbols = set(cfg.symbol for cfg in self.cfgs.values())
+                for symbol in underlying_symbols:
+                    stock_data = self.app.get_stream_data(symbol)
+                    stock_px = (
+                        stock_data.get("last")
+                        or stock_data.get("bid")
+                        or stock_data.get("ask")
+                    )
+                    prev_close = self.prev_closes.get(symbol)
+
+                    if stock_px and prev_close:
+                        gap = (stock_px - prev_close) / prev_close
+                        log.info(
+                            f"{symbol} Px={(f'{stock_px:.2f}' if stock_px else 'NA')}"
+                        )
+
+                        if abs(gap) >= 0.03:  # 3% 跳空閾值
+                            alert_msg, alert_id = generate_detailed_alert(
+                                symbol, "gap", gap, ContractConfig(symbol, "", 0, "")
+                            )
+                            alerts.append((alert_msg, alert_id))
+                            log.warning(f"偵測到 {symbol} 跳空: {gap:.1%}")
+                    else:
+                        log.info(f"{symbol} Px=NA")
+
+                # --- 保留原來的 SPY 檢查代碼以保持兼容性
                 spy_data = self.app.get_stream_data("SPY")
                 spy_px = (
                     spy_data.get("last") or spy_data.get("bid") or spy_data.get("ask")
                 )
-                if spy_px and self.spy_prev_close:
-                    gap = (spy_px - self.spy_prev_close) / self.spy_prev_close
-                    if abs(gap) >= 0.03:
-                        alert_msg, alert_id = generate_detailed_alert(
-                            "SPY", "gap", gap, ContractConfig("SPY", "", 0, "")
-                        )
-                        alerts.append((alert_msg, alert_id))
-                        log.warning(f"偵測到 SPY 跳空: {gap:.1%}")
-                log.info(f"SPY Px={(f'{spy_px:.2f}' if spy_px else 'NA')}")
+                if spy_px:
+                    log.info(f"SPY Px={spy_px:.2f}")
 
                 # --- 逐檔選擇權
                 for key, c in self.cfgs.items():
