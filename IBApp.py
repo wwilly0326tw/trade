@@ -345,9 +345,36 @@ class IBApp(EWrapper, EClient):
 
         # 1. 獲取伺服器時間
         server_time = self.get_server_time()
+
+        # -------------------------------------------------------------
+        # 若無法即時取得伺服器時間 (可能只是連線瞬斷)，採用「寬限期」策略，
+        # 以降低誤判市場休市的機率。
+        # -------------------------------------------------------------
+        GRACE_PERIOD = 600  # seconds; 10 minutes
+
         if not server_time:
-            log.warning("無法獲取伺服器時間")
+            # 若最近一次成功取得的 server_time 距今尚在寬限期內，
+            # 且先前市場判定為開市，則沿用原判定。
+            if (
+                self._last_server_time
+                and (time.time() - self._server_time_ts) < GRACE_PERIOD
+                and self.market_status.get("is_open", False)
+            ):
+                log.warning(
+                    "無法獲取伺服器時間 ‑ 使用緩存判斷市場仍在交易 (grace)"
+                )
+                # 不更新其他狀態，直接回傳沿用結果。
+                return self.market_status
+
+            # 超過寬限期 → 視為休市
+            log.warning("無法獲取伺服器時間，超過寬限期 → 視為休市")
             self.market_status["is_open"] = False
+
+            # 嘗試推算下一個開盤日，避免外部取得 None
+            if self._last_server_time:
+                self._calculate_next_trading_day(
+                    self._last_server_time.astimezone(self.us_eastern)
+                )
             return self.market_status
 
         # 轉換到美東時間
