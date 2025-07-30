@@ -13,7 +13,7 @@ from ibapi.contract import Contract, ContractDetails
 from ibapi.common import BarData
 
 # 常量定義
-TICK_LIST_OPT = "101,104,106,162,165,221,225,233,236,258,293,294,411,456"
+TICK_LIST_OPT = "101,106,165,221,225,233,236,258,293,294,411,456"
 TIMEOUT = 5.0  # 單檔行情等待秒數
 DEBUG = False
 
