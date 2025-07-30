@@ -1,0 +1,4 @@
+[submodule "ib-gateway-docker"]
+	path = ib-gateway-docker
+	url = git@github.com:wwilly0326tw/ib-gateway-docker.git
+	branch = master
