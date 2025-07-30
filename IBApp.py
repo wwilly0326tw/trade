@@ -4,7 +4,7 @@ import threading
 import datetime
 import logging
 from collections import deque
-from typing import Dict, Optional, Any
+from typing import List, Dict, Optional, Any
 
 import pytz
 from ibapi.client import EClient
@@ -47,6 +47,10 @@ class IBApp(EWrapper, EClient):
 
         # 美東時區
         self.us_eastern = pytz.timezone("US/Eastern")
+
+        # For positions tracking
+        self._positions = []
+        self._positions_completed = threading.Event()
 
     def _calculate_next_trading_day(self, et_now: datetime.datetime) -> None:
         """
@@ -360,9 +364,7 @@ class IBApp(EWrapper, EClient):
                 and (time.time() - self._server_time_ts) < GRACE_PERIOD
                 and self.market_status.get("is_open", False)
             ):
-                log.warning(
-                    "無法獲取伺服器時間 ‑ 使用緩存判斷市場仍在交易 (grace)"
-                )
+                log.warning("無法獲取伺服器時間 ‑ 使用緩存判斷市場仍在交易 (grace)")
                 # 不更新其他狀態，直接回傳沿用結果。
                 return self.market_status
 
@@ -451,3 +453,87 @@ class IBApp(EWrapper, EClient):
             if start_dt <= current_time < end_dt:
                 return True
         return False
+
+    # Add these new methods for position handling
+    def reqPositions(self):
+        """請求所有帳戶持倉數據"""
+        if not self.isConnected():
+            log.warning("無法請求艙位數據 - 未連接")
+            return False
+
+        # Reset positions collection
+        self._positions = []
+        self._positions_completed.clear()
+
+        # Request positions
+        super().reqPositions()
+        return True
+
+    def position(self, account: str, contract: Contract, pos: float, avgCost: float):
+        """處理持倉更新回調"""
+        # Store all position data
+        position_data = {
+            "account": account,
+            "conId": contract.conId,
+            "secType": contract.secType,
+            "symbol": contract.symbol,
+            "lastTradeDateOrContractMonth": contract.lastTradeDateOrContractMonth,
+            "strike": contract.strike,
+            "right": contract.right,
+            "exchange": contract.exchange,
+            "currency": contract.currency,
+            "position": pos,
+            "avgCost": avgCost,
+        }
+
+        self._positions.append(position_data)
+        log.debug(f"收到艙位更新: {contract.symbol} {pos}")
+
+    def positionEnd(self):
+        """艙位數據接收完成信號"""
+        log.info(f"艙位數據接收完畢，共 {len(self._positions)} 筆")
+        self._positions_completed.set()
+
+    def getPositions(
+        self, timeout: float = 10.0, refresh: bool = True
+    ) -> List[Dict[str, Any]]:
+        """獲取所有持倉數據
+
+        Parameters
+        ----------
+        timeout : float
+            最長等待時間（秒）
+        refresh : bool
+            是否請求新數據，否則返回緩存數據
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            持倉數據列表
+        """
+        if not self.isConnected():
+            log.warning("無法獲取艙位數據 - 未連接")
+            return []
+
+        if refresh:
+            # Reset and request new data
+            self._positions = []
+            self._positions_completed.clear()
+            super().reqPositions()
+
+            # Wait with timeout
+            self._positions_completed.wait(timeout)
+
+            if not self._positions_completed.is_set():
+                log.warning(f"獲取艙位數據超時 ({timeout}秒)")
+
+        return self._positions
+
+    def cancelPositions(self):
+        """取消持倉數據訂閱"""
+        if not self.isConnected():
+            log.warning("無法取消艙位訂閱 - 未連接")
+            return False
+
+        super().cancelPositions()
+        return True

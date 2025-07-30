@@ -25,7 +25,7 @@ from IBApp import IBApp
 
 # ---------------- 全域設定 ----------------
 HOST = "127.0.0.1"
-PORT = 4002  # Paper: 7497 / 4002
+PORT = 7496  # Paper: 7497 / 4002
 CID = random.randint(1000, 9999)
 TICK_LIST_OPT = "106"  # 要求 Option Greeks (IV / Δ)
 TIMEOUT = 5.0  # 單檔行情等待秒數
@@ -130,6 +130,10 @@ class AlertEngine:
 
         # 建立 streaming 訂閱 (一次性)
         self._subscribe_market_data()
+
+        # For position tracking
+        self.last_positions_update = time.time()
+        self.use_positions = True  # Flag to use positions or config
 
     # ---------- Streaming helpers ----------
     def _subscribe_market_data(self):
@@ -265,9 +269,111 @@ class AlertEngine:
 
         return market_status["is_open"]
 
+    def load_contracts_from_positions(self) -> Dict[str, ContractConfig]:
+        """從實際艙位中載入合約配置"""
+        log.info("從 IBKR 艙位資料載入合約...")
+
+        # 獲取艙位數據
+        positions = self.app.getPositions(timeout=5.0)
+
+        if not positions:
+            log.warning("無法獲取艙位數據或沒有持倉")
+            return {}
+
+        # 轉換為 ContractConfig 格式
+        contracts = {}
+        for pos in positions:
+            # 只處理期權類型和非零艙位
+            if pos["secType"] != "OPT" or pos["position"] == 0:
+                continue
+
+            symbol = pos["symbol"]
+            expiry = pos["lastTradeDateOrContractMonth"]
+            strike = pos["strike"]
+            right = pos["right"]
+
+            # 生成唯一 key
+            key = f"{symbol}_{right}_{strike}_{expiry}"
+
+            # 預設值 - 後續會由市場數據補充
+            delta = 0.0
+            premium = 0.0
+
+            # 根據艙位方向判斷 action
+            action = "SELL" if pos["position"] < 0 else "BUY"
+
+            contracts[key] = ContractConfig(
+                symbol=symbol,
+                expiry=expiry,
+                strike=strike,
+                right=right,
+                exchange=pos["exchange"],
+                currency=pos["currency"],
+                delta=delta,
+                premium=premium,
+                action=action,
+            )
+
+        log.info(f"成功載入 {len(contracts)} 筆合約")
+        return contracts
+
+    def get_positions_summary(self) -> str:
+        """獲取當前持倉摘要"""
+        positions = self.app.getPositions(refresh=False)  # Use cached positions
+
+        if not positions:
+            return "無持倉數據"
+
+        summary = []
+        for pos in positions:
+            if pos["position"] == 0:
+                continue
+
+            if pos["secType"] == "OPT":
+                summary.append(
+                    f"{pos['symbol']} {pos['right']} {pos['strike']} {pos['lastTradeDateOrContractMonth']}: {pos['position']} @ {pos['avgCost']:.2f}"
+                )
+            else:
+                summary.append(
+                    f"{pos['symbol']}: {pos['position']} @ {pos['avgCost']:.2f}"
+                )
+
+        return "\n".join(summary) if summary else "無有效持倉"
+
+    def refresh_positions(self, force: bool = False):
+        """定期刷新艙位數據"""
+        # 每 10 分鐘或強制刷新
+        if force or time.time() - self.last_positions_update > 600:  # 10 minutes
+            log.info("刷新艙位數據...")
+            positions_contracts = self.load_contracts_from_positions()
+
+            if positions_contracts:
+                # 更新合約配置
+                self.cfgs = positions_contracts
+                self.last_positions_update = time.time()
+                log.info(f"已更新艙位數據，共 {len(positions_contracts)} 筆合約")
+
+                # 重新訂閱所有合約的市場數據
+                self._subscribe_market_data()
+                log.info("已為所有艙位重新訂閱市場數據")
+            else:
+                log.warning("艙位數據為空，保留原有配置")
+
     def loop(self):
+        # Initial load from positions
+        self.refresh_positions(force=True)
+
+        # If no positions found, fall back to config
+        if not self.cfgs:
+            log.warning("未找到有效艙位，將使用配置文件")
+            config_manager = ConfigManager(self.path)
+            self.cfgs = config_manager.load()
+
         while True:
             try:
+                # 定期刷新艙位數據
+                self.refresh_positions()
+
                 # 檢查市場狀態
                 is_market_open = self._check_market_status()
 
