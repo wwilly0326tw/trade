@@ -27,6 +27,7 @@ class IBApp(EWrapper, EClient):
         EClient.__init__(self, self)
         self.ready = threading.Event()
         self.req_id = 1
+        self.contract_details: List[ContractDetails] = []
         # ───────── Market-data cache ─────────
         # original snapshot() 以 rid 為 key 暫存一次性資料；
         # 併發 / 長駐訂閱需要一份全域快取讓外部直接存取最新 tick。
@@ -88,14 +89,25 @@ class IBApp(EWrapper, EClient):
         self.req_id = max(self.req_id, oid)
         self.ready.set()
 
-    def error(self, reqId, code, msg, _=""):
-        if code in (2104, 2106, 2158):  # 市場資料伺服器通知
-            return
-        print(f"ERR {code}: {msg}")
+    def error(
+        self,
+        reqId: int,
+        errorCode: int,
+        errorString: str,
+        advancedOrderRejectJson: str = "",
+        *args,
+    ):
+        if errorCode in (2104, 2106, 2158, 321):  # exchange 未填
+            log.debug("IB ERR 321(%s): %s", reqId, errorString)
+            return  # 不跳 WARNING
+        # 其他錯誤維持 WARNING
+        log.warning("IB ERR %s(%s): %s", errorCode, reqId, errorString)
 
     # --- 市場狀態相關回調
-    def contractDetails(self, reqId, details: ContractDetails):
-        self.contract_details_queue.append(details)
+    def contractDetails(self, reqId: int, details: ContractDetails):
+        # 同步給 list 與 deque
+        self.contract_details.append(details)  ### <--
+        self.contract_details_queue.append(details)  ### <--
 
     def contractDetailsEnd(self, reqId):
         self.contract_details_available.set()
@@ -484,6 +496,8 @@ class IBApp(EWrapper, EClient):
             "currency": contract.currency,
             "position": pos,
             "avgCost": avgCost,
+            "tradingClass": contract.tradingClass,
+            "multiplier": contract.multiplier,
         }
 
         self._positions.append(position_data)
@@ -537,3 +551,18 @@ class IBApp(EWrapper, EClient):
 
         super().cancelPositions()
         return True
+
+    def req_contract_details_blocking(self, contract: Contract, timeout: float = 5.0):
+        """
+        同步封裝：回傳 list[ContractDetails]。
+        需要先在 __init__() 裡 self.contract_details = []
+        """
+        self.contract_details.clear()
+        self.reqContractDetails(9001, contract)
+        t0 = time.time()
+        while time.time() - t0 < timeout and not self.contract_details:
+            time.sleep(0.05)
+        return self.contract_details
+
+    def contractDetails(self, reqId, details):
+        self.contract_details.append(details)

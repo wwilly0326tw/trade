@@ -2,3 +2,4 @@ logs/*
 # Python bytecode files
 __pycache__/
 *.py[cod]
+alert_engine.log
