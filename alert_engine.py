@@ -1,35 +1,28 @@
-# alert_engine.py
-"""
-封裝選擇權監控 & 警報邏輯。
-可由任何主程式 import 使用，不依賴 CLI。
-"""
 from __future__ import annotations
-import os, json, time, datetime, requests, logging, pytz
+import os, time, datetime, logging, requests, pytz
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 from ibapi.contract import Contract
-from IBApp import IBApp  # ← 直接重用您自訂的 IBApp
+from IBApp import IBApp
 
 log = logging.getLogger(__name__)
 
 # ---------- LINE Push ---------- #
-_CHANNEL_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-_LINE_ENDPOINT = "https://api.line.me/v2/bot/message/broadcast"
-_LINE_HEADERS = {
-    "Authorization": f"Bearer {_CHANNEL_TOKEN}",
-    "Content-Type": "application/json",
-}
+_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+_LINE_EP = "https://api.line.me/v2/bot/message/broadcast"
+_HEADERS = {"Authorization": f"Bearer {_TOKEN}", "Content-Type": "application/json"}
 
 
 def line_push(msg: str):
-    """Broadcast 文字訊息到所有已加入 Bot 的聊天室。"""
-    if not _CHANNEL_TOKEN:
+    if not _TOKEN:
         log.warning("未設定 LINE TOKEN，警報僅寫入日誌")
         return
-    payload = {"messages": [{"type": "text", "text": msg[:1000]}]}
     try:
         r = requests.post(
-            _LINE_ENDPOINT, headers=_LINE_HEADERS, json=payload, timeout=5
+            _LINE_EP,
+            headers=_HEADERS,
+            json={"messages": [{"type": "text", "text": msg[:1000]}]},
+            timeout=5,
         )
         if r.status_code != 200:
             log.error("LINE API %s: %s", r.status_code, r.text[:200])
@@ -59,91 +52,65 @@ class ContractConfig:
 
     def to_ib(self) -> Contract:
         c = Contract()
-        c.symbol = self.symbol
-        c.secType = "OPT"
-        c.exchange = self.exchange
-        c.currency = self.currency
-        c.right = self.right
-        c.strike = self.strike
-        c.lastTradeDateOrContractMonth = self.expiry
+        c.symbol, c.secType, c.exchange, c.currency = (
+            self.symbol,
+            "OPT",
+            self.exchange,
+            self.currency,
+        )
+        c.right, c.strike, c.lastTradeDateOrContractMonth = (
+            self.right,
+            self.strike,
+            self.expiry,
+        )
         return c
-
-
-# ---------- 配置讀取 ---------- #
-class ConfigManager:
-    def __init__(self, path: str = "spy_contracts_config.json"):
-        self.path = path
-
-    def load(self) -> Dict[str, ContractConfig]:
-        if not os.path.exists(self.path):
-            raise FileNotFoundError(self.path)
-        with open(self.path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        return {k: ContractConfig(**v) for k, v in raw.items()}
 
 
 # ---------------- 警報引擎 ----------------
 class AlertEngine:
-    def __init__(
-        self, app: IBApp, cfgs: Dict[str, ContractConfig], rule: StrategyConfig
-    ):
+    def __init__(self, app: IBApp, rule: StrategyConfig):
         self.app = app
-        self.cfgs = cfgs
         self.rule = rule
+        self.cfgs: Dict[str, ContractConfig] = {}  # 動態生成
         self.init_price: Dict[str, float] = {}
-        self.prev_closes: Dict[str, float] = {}  # 存儲各標的物昨收
-
-        # SPY 股票合約 (兼容性保留)
-        self.spy_con = Contract()
-        self.spy_con.symbol = "SPY"
-        self.spy_con.secType = "STK"
-        self.spy_con.exchange = "SMART"
-        self.spy_con.currency = "USD"
-        self.spy_prev_close: float | None = None
-
-        # 記錄已發送的警報及發送日期
+        self.prev_closes: Dict[str, float] = {}
         self.sent_alerts: Dict[str, datetime.date] = {}
         self.trading_date = datetime.date.today()
         self.market_closed_notified = False
         self.last_market_status_check = datetime.datetime.min
+        self.last_positions_update = 0.0
 
-        # For position tracking
-        self.last_positions_update = time.time()
-        self.use_positions = True  # Flag to use positions or config
-
-        # 建立 streaming 訂閱
-        self._subscribe_market_data()
+        # 先載入當前持倉並訂閱行情
+        self.refresh_positions(force=True)
 
     # ---------- Streaming helpers ----------
     def _subscribe_market_data(self):
-        """根據合約配置訂閱市場數據，包括標的股票和選擇權"""
-        # 清理之前訂閱的數據 (可選，視 IBApp 實現而定)
-        # 需要先獲取所有唯一的標的股票
-        underlying_symbols = set()
-
-        # 從合約配置中獲取所有唯一的標的股票符號
-        for key, cfg in self.cfgs.items():
-            underlying_symbols.add(cfg.symbol)
-
-        # 訂閱所有標的股票
-        for symbol in underlying_symbols:
-            stk_con = Contract()
-            stk_con.symbol = symbol
-            stk_con.secType = "STK"
-            stk_con.exchange = "SMART"
-            stk_con.currency = "USD"
-            self.app.subscribe(stk_con, False, symbol)
-            log.info(f"已訂閱 {symbol} 股票行情")
-
-        # 訂閱所有選擇權合約
-        option_count = 0
+        underlying_symbols = {cfg.symbol for cfg in self.cfgs.values()}
+        for sym in underlying_symbols:
+            c = Contract()
+            c.symbol, c.secType, c.exchange, c.currency = sym, "STK", "SMART", "USD"
+            self.app.subscribe(c, False, sym)
         for key, cfg in self.cfgs.items():
             self.app.subscribe(cfg.to_ib(), True, key)
-            option_count += 1
+        log.info("已訂閱 %d 標的與 %d 期權", len(underlying_symbols), len(self.cfgs))
 
-        log.info(
-            f"已訂閱 {len(underlying_symbols)} 個股票和 {option_count} 個選擇權合約的市場數據"
-        )
+    def _load_from_positions(self) -> Dict[str, ContractConfig]:
+        positions = self.app.getPositions(timeout=5.0)
+        out: Dict[str, ContractConfig] = {}
+        for p in positions or []:
+            if p["secType"] != "OPT" or p["position"] == 0:
+                continue
+            key = f"{p['symbol']}_{p['right']}_{p['strike']}_{p['lastTradeDateOrContractMonth']}"
+            out[key] = ContractConfig(
+                symbol=p["symbol"],
+                expiry=p["lastTradeDateOrContractMonth"],
+                strike=p["strike"],
+                right=p["right"],
+                exchange=p["exchange"],
+                currency=p["currency"],
+                action="SELL" if p["position"] < 0 else "BUY",
+            )
+        return out
 
     def _dte(self, expiry: str) -> int:
         expire = datetime.datetime.strptime(expiry, "%Y%m%d").date()
@@ -353,26 +320,13 @@ class AlertEngine:
         return "\n".join(summary) if summary else "無有效持倉"
 
     def refresh_positions(self, force: bool = False):
-        """定期刷新艙位數據"""
-        # 每 10 分鐘或強制刷新
-        if force or time.time() - self.last_positions_update > 600:  # 10 minutes
-            log.info("刷新艙位數據...")
-            positions_contracts = self.load_contracts_from_positions()
-
-            if positions_contracts:
-                # 更新合約配置
-                self.cfgs = positions_contracts
+        if force or time.time() - self.last_positions_update > 600:
+            new_cfgs = self._load_from_positions()
+            if new_cfgs:
+                self.cfgs = new_cfgs
                 self.last_positions_update = time.time()
-                log.info(f"已更新艙位數據，共 {len(positions_contracts)} 筆合約")
-
-                # 重新訂閱所有合約的市場數據
                 self._subscribe_market_data()
-                log.info("已為所有艙位重新訂閱市場數據")
-
-                # 更新初始價格及昨收價格
                 self._update_initial_prices()
-            else:
-                log.warning("艙位數據為空，保留原有配置")
 
     def _update_initial_prices(self):
         """更新初始價格和前收盤價格"""

@@ -4,7 +4,7 @@
 
 import random, sys, signal, threading, logging, logging.handlers
 from pathlib import Path
-from alert_engine import AlertEngine, StrategyConfig, ConfigManager
+from alert_engine import AlertEngine, StrategyConfig
 from IBApp import IBApp
 
 HOST, PORT = "127.0.0.1", 7496
@@ -36,10 +36,6 @@ def setup_logging():
 log = setup_logging()
 log.info("監控主程式啟動")
 
-# ---------- 讀取合約配置 ---------- #
-cfgs = ConfigManager().load()
-log.info("讀取 %d 檔合約", len(cfgs))
-
 # ---------- 連線 IBKR ---------- #
 app = IBApp()
 app.connect(HOST, PORT, CID)
@@ -50,7 +46,7 @@ if not app.ready.wait(5):
 
 # ---------- 啟動警報引擎 ---------- #
 rule = StrategyConfig()
-engine = AlertEngine(app, cfgs, rule)
+engine = AlertEngine(app, rule)
 engine.first_snap()
 
 
