@@ -25,7 +25,7 @@ from IBApp import IBApp
 
 # ---------------- 全域設定 ----------------
 HOST = "127.0.0.1"
-PORT = 4001  # Paper: 7497 / 4002
+PORT = 7496  # Paper: 7497 / 4002
 CID = random.randint(1000, 9999)
 TICK_LIST_OPT = "106"  # 要求 Option Greeks (IV / Δ)
 TIMEOUT = 5.0  # 單檔行情等待秒數
@@ -410,6 +410,19 @@ class AlertEngine:
                 if prev_close:
                     self.prev_closes[symbol] = prev_close
                     log.info(f"更新 {symbol} 昨收價格: {prev_close}")
+
+    def _get_underlying_prev_close(
+        self, symbol: str, timeout: float = 10.0
+    ) -> Optional[float]:
+        """等待 streaming 資料填入指定標的物的昨日收盤價，最多 *timeout* 秒。"""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            data = self.app.get_stream_data(symbol)
+            close_val = data.get("prev_close") or data.get("close")
+            if close_val:
+                return close_val
+            time.sleep(0.1)
+        return None
 
     def loop(self):
         # Initial load from positions
