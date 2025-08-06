@@ -1,69 +1,47 @@
-# spy_option_alert_loop_ibapi.py
+# alert_engine.py
 """
-SPY 選擇權警報系統（循環版 ‑ ibapi）
-------------------------------------------------
-* 讀取 **spy_contracts_config.json** 內所有 PUT / CALL 合約；每 `CHECK_INTERVAL` 秒更新行情。
-* 監控條件：Delta、收益率（相對 premium；SELL 價格愈低愈正）、剩餘 DTE、以及 SPY 跳空 ±3 %。
-* `DEBUG=True` 會完整列印回傳 Tick 字典，便於檢查缺失欄位／IV 為 0 的原因。
-* 兼容 `tickOptionComputation` 多版本參數（API ≥ v10.19）。
+封裝選擇權監控 & 警報邏輯。
+可由任何主程式 import 使用，不依賴 CLI。
 """
 from __future__ import annotations
-
-import json, os, sys, time, threading, random, signal, datetime, requests, re
+import os, json, time, datetime, requests, logging, pytz
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional, Tuple
-from ibapi.client import EClient
-from ibapi.wrapper import EWrapper
-from ibapi.contract import Contract, ContractDetails
-from ibapi.common import BarData
-import logging
-import logging.handlers
-from pathlib import Path
-from collections import deque
-import pytz
-from IBApp import IBApp
+from typing import Dict, Any, List, Optional
+from ibapi.contract import Contract
+from IBApp import IBApp  # ← 直接重用您自訂的 IBApp
 
-# ---------------- 全域設定 ----------------
-HOST = "127.0.0.1"
-PORT = 7496  # Paper: 7497 / 4002
-CID = random.randint(1000, 9999)
-TICK_LIST_OPT = "106"  # 要求 Option Greeks (IV / Δ)
-TIMEOUT = 5.0  # 單檔行情等待秒數
-CHECK_INTERVAL = 60  # 監控輪詢秒數
-DEBUG = False  # True 時打印完整 Tick
+log = logging.getLogger(__name__)
 
-# LINE Messaging API ── 使用者提供的長期權杖（若環境變數未設則採用此值）
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or (
-    "jpDKXxch8e/m30Ll4irnKE5Rcwv8bNslQ0f4H4DpyMmQ4dWJNOuWDN/VUC29C7iD/"
-    "XWjDFrlRMZHAXgbdNwaUTGzpoO2sUSwSpwUonpIRTZ6TDZdsIfyz/G6Xf3RaqAsDbYti"
-    "+NKTkFPR6XHDTL5jwdB04t89/1O/w1cDnyilFU="
-)
-LINE_ENDPOINT = "https://api.line.me/v2/bot/message/broadcast"
-LINE_HEADERS = {
-    "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+# ---------- LINE Push ---------- #
+_CHANNEL_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+_LINE_ENDPOINT = "https://api.line.me/v2/bot/message/broadcast"
+_LINE_HEADERS = {
+    "Authorization": f"Bearer {_CHANNEL_TOKEN}",
     "Content-Type": "application/json",
 }
 
 
 def line_push(msg: str):
-    """以 Broadcast 方式推播文字訊息到所有已加入 Bot 的聊天室。"""
-    if not CHANNEL_ACCESS_TOKEN:
-        print("[WARN] 未設定 LINE CHANNEL TOKEN，警報只會顯示在終端機。")
+    """Broadcast 文字訊息到所有已加入 Bot 的聊天室。"""
+    if not _CHANNEL_TOKEN:
+        log.warning("未設定 LINE TOKEN，警報僅寫入日誌")
         return
     payload = {"messages": [{"type": "text", "text": msg[:1000]}]}
     try:
-        r = requests.post(LINE_ENDPOINT, headers=LINE_HEADERS, json=payload, timeout=5)
+        r = requests.post(
+            _LINE_ENDPOINT, headers=_LINE_HEADERS, json=payload, timeout=5
+        )
         if r.status_code != 200:
-            print(f"[ERR] LINE Broadcast {r.status_code}: {r.text[:200]}")
+            log.error("LINE API %s: %s", r.status_code, r.text[:200])
     except Exception as exc:
-        print(f"[ERR] LINE Broadcast 例外: {exc}")
+        log.error("LINE Broadcast 例外: %s", exc)
 
 
-# ---------------- 資料類別 ----------------
+# ---------- 資料類別 ---------- #
 @dataclass
 class StrategyConfig:
     delta_threshold: float = 0.30
-    profit_target: float = 0.50  # 50%
+    profit_target: float = 0.50  # 50 %
     min_dte: int = 21
 
 
@@ -91,7 +69,7 @@ class ContractConfig:
         return c
 
 
-# ---------------- 配置讀取 ----------------
+# ---------- 配置讀取 ---------- #
 class ConfigManager:
     def __init__(self, path: str = "spy_contracts_config.json"):
         self.path = path
@@ -570,132 +548,3 @@ class AlertEngine:
             except:
                 log.exception("主循環發生未處理例外，60 秒後重試")
                 time.sleep(60)
-
-
-# ---------------- Main ----------------
-def main():
-    # 設置日誌系統
-    global log
-    log = setup_logging()
-
-    log.info("SPY 選擇權監控系統啟動")
-    cfgs = ConfigManager().load()
-    log.info(f"讀取 {len(cfgs)} 檔合約 → 連線 {HOST}:{PORT}")
-
-    # 連線並開啟事件迴圈
-    app = IBApp()
-    app.connect(HOST, PORT, CID)
-    threading.Thread(target=app.run, daemon=True).start()
-    if not app.ready.wait(5):
-        log.error("握手逾時，請確認 TWS/Gateway")
-        return
-
-    # 建立警報引擎
-    rule = StrategyConfig()
-    eng = AlertEngine(app, cfgs, rule)
-    eng.first_snap()
-
-    # 安全中斷
-    def shutdown(sig, _):
-        log.info("收到終止信號，正在斷線...")
-        app.disconnect()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
-
-    # 進入監控迴圈
-    try:
-        eng.loop()
-    finally:
-        app.disconnect()
-
-
-# 設置日誌系統
-def setup_logging():
-    """設置日誌系統，每兩天輪換一次檔案。"""
-    # 確保日誌目錄存在
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-
-    # 主要日誌設置
-    logger = logging.getLogger("spy_monitor")
-    logger.setLevel(logging.INFO)
-
-    # 檔案處理器 - 每兩天輪換一次
-    log_file = log_dir / "spy_monitor.log"
-    file_handler = logging.handlers.TimedRotatingFileHandler(
-        log_file, when="D", interval=2, backupCount=10, encoding="utf-8"
-    )
-
-    # 終端機處理器
-    console_handler = logging.StreamHandler()
-
-    # 日誌格式
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
-
-    # 添加處理器
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-
-    logger.info("日誌系統已初始化，檔案將每兩天輪換一次")
-    return logger
-
-
-# Function to generate more detailed alert messages
-def generate_detailed_alert(
-    key: str,
-    alert_type: str,
-    value: float,
-    contract: ContractConfig,
-    extra_info: dict = None,
-) -> tuple[str, str]:  # Return both message and a unique ID
-    """生成詳細的警報訊息，包含觸發原因和建議動作。"""
-    extra_info = extra_info or {}
-    current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-
-    # 基本訊息格式
-    if alert_type == "delta":
-        emoji = "🚨"
-        detail = (
-            f"{key} Delta={value:.3f} 已超過閾值 {extra_info.get('threshold', 0.3):.2f}"
-        )
-        action = f"建議關注 {contract.symbol} {contract.strike}{'P' if contract.right=='PUT' else 'C'} 風險增加"
-
-    elif alert_type == "profit":
-        emoji = "💰"
-        detail = (
-            f"{key} 收益={value:.1%} 已達目標 {extra_info.get('target', 0.5):.1%}"
-            f" ({contract.action} {contract.premium:.2f}→{extra_info.get('price', 0):.2f})"
-        )
-        action = f"可考慮{'買回' if contract.action=='SELL' else '賣出'}平倉獲利"
-
-    elif alert_type == "dte":
-        emoji = "📅"
-        detail = f"{key} 剩餘天數={value}天 低於設定 {extra_info.get('min_dte', 36)}天"
-        action = "注意時間價值加速衰減，評估是否調整部位"
-
-    elif alert_type == "gap":
-        emoji = "⚡"
-        direction = "上漲" if value > 0 else "下跌"
-        detail = f"SPY {direction} {abs(value):.1%}，大幅跳空"
-        action = (
-            f"請密切關注市場波動，{'PUT' if value > 0 else 'CALL'}選擇權可能受影響較大"
-        )
-
-    # 組合完整訊息
-    full_message = f"{emoji} {current_date}\n" f"{detail}\n" f"{action}"
-
-    # 創建每日唯一的警報識別碼
-    trading_date = datetime.datetime.now().strftime("%Y%m%d")
-    unique_id = f"{alert_type}_{key}_{trading_date}"
-
-    return full_message, unique_id
-
-
-if __name__ == "__main__":
-    main()
