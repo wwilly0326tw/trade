@@ -99,8 +99,6 @@ def line_push(msg: str) -> None:
         log.warning("未設定 LINE TOKEN，警報僅寫入日誌")
         return
     try:
-        print(_HEADERS)
-        print(_TOKEN)
         r = requests.post(
             _LINE_EP,
             headers=_HEADERS,

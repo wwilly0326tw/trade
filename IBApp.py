@@ -563,6 +563,3 @@ class IBApp(EWrapper, EClient):
         while time.time() - t0 < timeout and not self.contract_details:
             time.sleep(0.05)
         return self.contract_details
-
-    def contractDetails(self, reqId, details):
-        self.contract_details.append(details)
