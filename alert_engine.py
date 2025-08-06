@@ -11,6 +11,7 @@ log = logging.getLogger(__name__)
 _TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 _LINE_EP = "https://api.line.me/v2/bot/message/broadcast"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "Content-Type": "application/json"}
+CHECK_INTERVAL = 60  # 每分鐘檢查一次
 
 
 def line_push(msg: str):
@@ -356,15 +357,56 @@ class AlertEngine:
             time.sleep(0.1)
         return None
 
+    def generate_detailed_alert(
+        key: str,
+        alert_type: str,
+        value: float,
+        contract: ContractConfig,
+        extra_info: dict = None,
+    ) -> tuple[str, str]:  # Return both message and a unique ID
+        """生成詳細的警報訊息，包含觸發原因和建議動作。"""
+        extra_info = extra_info or {}
+        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+
+        # 基本訊息格式
+        if alert_type == "delta":
+            emoji = "🚨"
+            detail = f"{key} Delta={value:.3f} 已超過閾值 {extra_info.get('threshold', 0.3):.2f}"
+            action = f"建議關注 {contract.symbol} {contract.strike}{'P' if contract.right=='PUT' else 'C'} 風險增加"
+
+        elif alert_type == "profit":
+            emoji = "💰"
+            detail = (
+                f"{key} 收益={value:.1%} 已達目標 {extra_info.get('target', 0.5):.1%}"
+                f" ({contract.action} {contract.premium:.2f}→{extra_info.get('price', 0):.2f})"
+            )
+            action = f"可考慮{'買回' if contract.action=='SELL' else '賣出'}平倉獲利"
+
+        elif alert_type == "dte":
+            emoji = "📅"
+            detail = (
+                f"{key} 剩餘天數={value}天 低於設定 {extra_info.get('min_dte', 36)}天"
+            )
+            action = "注意時間價值加速衰減，評估是否調整部位"
+
+        elif alert_type == "gap":
+            emoji = "⚡"
+            direction = "上漲" if value > 0 else "下跌"
+            detail = f"SPY {direction} {abs(value):.1%}，大幅跳空"
+            action = f"請密切關注市場波動，{'PUT' if value > 0 else 'CALL'}選擇權可能受影響較大"
+
+        # 組合完整訊息
+        full_message = f"{emoji} {current_date}\n" f"{detail}\n" f"{action}"
+
+        # 創建每日唯一的警報識別碼
+        trading_date = datetime.datetime.now().strftime("%Y%m%d")
+        unique_id = f"{alert_type}_{key}_{trading_date}"
+
+        return full_message, unique_id
+
     def loop(self):
         # Initial load from positions
         self.refresh_positions(force=True)
-
-        # If no positions found, fall back to config
-        if not self.cfgs:
-            log.warning("未找到有效艙位，將使用配置文件")
-            config_manager = ConfigManager(self.path)
-            self.cfgs = config_manager.load()
 
         while True:
             try:
@@ -404,7 +446,7 @@ class AlertEngine:
                         )
 
                         if abs(gap) >= 0.03:  # 3% 跳空閾值
-                            alert_msg, alert_id = generate_detailed_alert(
+                            alert_msg, alert_id = self.generate_detailed_alert(
                                 symbol, "gap", gap, ContractConfig(symbol, "", 0, "")
                             )
                             alerts.append((alert_msg, alert_id))
@@ -435,7 +477,7 @@ class AlertEngine:
 
                     # Δ 警報
                     if delta_abs >= self.rule.delta_threshold:
-                        alert_msg, alert_id = generate_detailed_alert(
+                        alert_msg, alert_id = self.generate_detailed_alert(
                             key,
                             "delta",
                             delta_abs,
@@ -453,7 +495,7 @@ class AlertEngine:
                         else (price - base) / base
                     )
                     if pct >= self.rule.profit_target:
-                        alert_msg, alert_id = generate_detailed_alert(
+                        alert_msg, alert_id = self.generate_detailed_alert(
                             key,
                             "profit",
                             pct,
@@ -465,7 +507,7 @@ class AlertEngine:
 
                     # DTE
                     if dte <= self.rule.min_dte:
-                        alert_msg, alert_id = generate_detailed_alert(
+                        alert_msg, alert_id = self.generate_detailed_alert(
                             key, "dte", dte, c, {"min_dte": self.rule.min_dte}
                         )
                         alerts.append((alert_msg, alert_id))
