@@ -84,7 +84,11 @@ log = logging.getLogger(__name__)
 
 # ─────────────────────────── LINE Push ──────────────────────────
 
-_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "") or (
+    "jpDKXxch8e/m30Ll4irnKE5Rcwv8bNslQ0f4H4DpyMmQ4dWJNOuWDN/VUC29C7iD/"
+    "XWjDFrlRMZHAXgbdNwaUTGzpoO2sUSwSpwUonpIRTZ6TDZdsIfyz/G6Xf3RaqAsDbYti"
+    "+NKTkFPR6XHDTL5jwdB04t89/1O/w1cDnyilFU="
+)
 _LINE_EP = "https://api.line.me/v2/bot/message/broadcast"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "Content-Type": "application/json"}
 CHECK_INTERVAL = 60  # 每分鐘檢查一次
@@ -95,6 +99,8 @@ def line_push(msg: str) -> None:
         log.warning("未設定 LINE TOKEN，警報僅寫入日誌")
         return
     try:
+        print(_HEADERS)
+        print(_TOKEN)
         r = requests.post(
             _LINE_EP,
             headers=_HEADERS,
@@ -219,6 +225,7 @@ class AlertEngine:
                 f"{p['symbol']}_{p['right']}_{p['strike']}_"
                 f"{p['lastTradeDateOrContractMonth']}"
             )
+            multiplier_val = float(p.get("multiplier") or 100)
             out[key] = ContractConfig(
                 symbol=p["symbol"],
                 expiry=p["lastTradeDateOrContractMonth"],
@@ -230,6 +237,7 @@ class AlertEngine:
                 con_id=p["conId"],  ### ← 新增
                 trading_class=p.get("tradingClass", ""),  ### ← 新增
                 multiplier=p.get("multiplier", "100"),  ### ← 新增
+                premium=p["avgCost"] / multiplier_val,
             )
         return out
 
@@ -554,12 +562,12 @@ class AlertEngine:
                         log.warning("%s Delta=%.3f 超過閾值", key, delta_abs)
 
                     # 收益率
-                    base = c.premium or 1e-9  # 避免除以零
-                    pct = (
-                        (base - price) / base
-                        if c.action.upper() == "SELL"
-                        else (price - base) / base
-                    )
+                    base = abs(c.premium) or 1e-9
+                    if c.action.upper() == "SELL":
+                        pct = (base - price) / base
+                    else:
+                        pct = (price - base) / base
+
                     if pct >= self.rule.profit_target:
                         msg, aid = self.generate_detailed_alert(
                             key,
