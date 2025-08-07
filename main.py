@@ -7,7 +7,7 @@ from pathlib import Path
 from alert_engine import AlertEngine, StrategyConfig
 from IBApp import IBApp
 
-HOST, PORT = "127.0.0.1", 7496
+HOST, PORT = "127.0.0.1", 4002
 CID = random.randint(1000, 9999)
 
 

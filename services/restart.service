@@ -1,7 +1,7 @@
 [Unit]
-Description=Restart My App Service
+Description=Restart Option Monitor Service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/systemctl restart spy-monitor.service
+ExecStart=/bin/systemctl restart option-monitor.service
 

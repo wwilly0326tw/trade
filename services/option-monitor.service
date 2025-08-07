@@ -1,8 +1,8 @@
 [Unit]
-Description=My Python Script
+Description=Monitor script
 
 [Service]
-ExecStart=/usr/bin/python3.12 /synosrc/ds.base/source/research/trade/spy_monitor.py
+ExecStart=/usr/bin/python3.12 /synosrc/ds.base/source/research/trade/main.py
 WorkingDirectory=/synosrc/ds.base/source/research/trade
 ExecStartPre=/usr/bin/git pull
 Restart=on-failure
