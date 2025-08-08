@@ -2,16 +2,21 @@
 啟動 IB 連線並交給 AlertEngine 監控選擇權。
 """
 
-import random, sys, signal, threading, logging, logging.handlers
+import random
+import sys
+import signal
+import threading
+import logging
+import logging.handlers
 from pathlib import Path
+
 from alert_engine import AlertEngine, StrategyConfig
 from IBApp import IBApp
 
-HOST, PORT = "127.0.0.1", 4002
+HOST, PORT = "127.0.0.1", 4001
 CID = random.randint(1000, 9999)
 
 
-# ---------- 日誌系統 ---------- #
 def setup_logging():
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
@@ -22,11 +27,7 @@ def setup_logging():
         handlers=[
             logging.StreamHandler(),
             logging.handlers.TimedRotatingFileHandler(
-                log_dir / "monitor.log",
-                when="D",
-                interval=2,
-                backupCount=10,
-                encoding="utf-8",
+                log_dir / "monitor.log", when="D", interval=2, backupCount=10, encoding="utf-8"
             ),
         ],
     )
@@ -36,7 +37,7 @@ def setup_logging():
 log = setup_logging()
 log.info("監控主程式啟動")
 
-# ---------- 連線 IBKR ---------- #
+# ---------- 連線 IBKR（與原行為一致） ---------- #
 app = IBApp()
 app.connect(HOST, PORT, CID)
 threading.Thread(target=app.run, daemon=True).start()
@@ -44,7 +45,7 @@ if not app.ready.wait(5):
     log.error("與 TWS/Gateway 握手逾時")
     sys.exit(1)
 
-# ---------- 啟動警報引擎 ---------- #
+# ---------- 啟動警報引擎（行為不變） ---------- #
 rule = StrategyConfig()
 engine = AlertEngine(app, rule)
 engine.first_snap()
