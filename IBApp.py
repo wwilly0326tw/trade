@@ -28,6 +28,8 @@ class IBApp(EWrapper, EClient):
         self.ready = threading.Event()
         self.req_id = 1
         self.contract_details: List[ContractDetails] = []
+        self.reqMarketDataType(3)
+
         # ───────── Market-data cache ─────────
         # original snapshot() 以 rid 為 key 暫存一次性資料；
         # 併發 / 長駐訂閱需要一份全域快取讓外部直接存取最新 tick。
