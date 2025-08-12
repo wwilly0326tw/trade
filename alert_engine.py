@@ -97,9 +97,10 @@ def line_push(msg: str) -> None:
 
 @dataclass(slots=True)
 class StrategyConfig:
-    delta_threshold: float = 0.30
-    profit_target: float = 0.50  # 50 %
+    profit_target: float = 0.50
     min_dte: int = 21
+    sell_delta_threshold: float = 0.30  # 只對 SELL 生效的上限
+    buy_delta_floor: float = 0.65  # 只對 BUY 生效的下限
 
 
 @dataclass(slots=True)
@@ -405,8 +406,14 @@ class AlertEngine:
 
         if alert_type == "delta":
             emoji = "🚨"
-            detail = f"{key} Delta={value:.3f} 已超過閾值 {extra_info.get('threshold', 0.3):.2f}"
-            action = f"建議關注 {contract.symbol} {contract.strike}{'P' if contract.right=='PUT' else 'C'} 風險增加"
+            mode = extra_info.get("mode", contract.action.upper())  # "SELL" or "BUY"
+            th = extra_info.get("threshold", 0.30)
+            if mode == "SELL":
+                detail = f"{key} Δ={value:.3f}（SELL）已超過閾值 {th:.2f}"
+                action = f"建議關注 {contract.symbol} {contract.strike}{'P' if contract.right=='PUT' else 'C'} 風險增加"
+            else:
+                detail = f"{key} Δ={value:.3f}（BUY）已低於門檻 {th:.2f}"
+                action = f"留意部位敏感度下降（可評估調整或加值）"
         elif alert_type == "profit":
             emoji = "💰"
             detail = (
@@ -496,18 +503,38 @@ class AlertEngine:
 
                     dte = self._dte(c.expiry)
                     delta_abs = abs(delta)
+                    is_sell = c.action.upper() == "SELL"
+                    sell_thr = getattr(self.rule, "sell_delta_threshold", 0.30)
+                    buy_floor = getattr(self.rule, "buy_delta_floor", 0.65)
 
                     # Δ 門檻
-                    if delta_abs >= self.rule.delta_threshold:
+                    # SELL：|Δ| >= 0.30 才警報
+                    if is_sell and delta_abs >= sell_thr:
                         msg, aid = self.generate_detailed_alert(
                             key,
                             "delta",
                             delta_abs,
                             c,
-                            {"threshold": self.rule.delta_threshold},
+                            {"threshold": sell_thr, "mode": "SELL"},
                         )
                         alerts.append((msg, aid))
-                        log.warning("%s Delta=%.3f 超過閾值", key, delta_abs)
+                        log.warning(
+                            "%s Δ=%.3f (SELL) 超過 %.2f", key, delta_abs, sell_thr
+                        )
+
+                    # BUY：|Δ| <= 0.65 才警報
+                    elif (not is_sell) and delta_abs <= buy_floor:
+                        msg, aid = self.generate_detailed_alert(
+                            key,
+                            "delta",
+                            delta_abs,
+                            c,
+                            {"threshold": buy_floor, "mode": "BUY"},
+                        )
+                        alerts.append((msg, aid))
+                        log.warning(
+                            "%s Δ=%.3f (BUY) 低於 %.2f", key, delta_abs, buy_floor
+                        )
 
                     # 收益率（行為不變）
                     base = abs(c.premium) or 1e-9
