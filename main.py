@@ -9,6 +9,7 @@ import threading
 import logging
 import logging.handlers
 from pathlib import Path
+from ibapi.client import MarketDataTypeEnum
 
 from alert_engine import AlertEngine, StrategyConfig
 from IBApp import IBApp
@@ -27,7 +28,11 @@ def setup_logging():
         handlers=[
             logging.StreamHandler(),
             logging.handlers.TimedRotatingFileHandler(
-                log_dir / "monitor.log", when="D", interval=2, backupCount=10, encoding="utf-8"
+                log_dir / "monitor.log",
+                when="D",
+                interval=2,
+                backupCount=10,
+                encoding="utf-8",
             ),
         ],
     )
@@ -44,6 +49,9 @@ threading.Thread(target=app.run, daemon=True).start()
 if not app.ready.wait(5):
     log.error("與 TWS/Gateway 握手逾時")
     sys.exit(1)
+
+
+app.reqMarketDataType(MarketDataTypeEnum.DELAYED)  # 等同 app.reqMarketDataType(3)
 
 # ---------- 啟動警報引擎（行為不變） ---------- #
 rule = StrategyConfig()

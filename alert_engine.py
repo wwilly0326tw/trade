@@ -14,8 +14,11 @@ from ibapi.contract import Contract
 
 from IBApp import IBApp
 
+
 # ─────────────────────────── 日誌設定 ────────────────────────────
-def configure_logging(level: str = "INFO", noisy_loggers: list[str] | None = None) -> None:
+def configure_logging(
+    level: str = "INFO", noisy_loggers: list[str] | None = None
+) -> None:
     numeric = getattr(logging, level.upper(), logging.INFO)
 
     console = logging.StreamHandler()
@@ -23,6 +26,7 @@ def configure_logging(level: str = "INFO", noisy_loggers: list[str] | None = Non
 
     class DedupFilter(logging.Filter):
         _cache: dict[str, float] = {}
+
         def filter(self, record: logging.LogRecord) -> bool:  # noqa: N802
             msg, now = record.getMessage(), record.created
             last = self._cache.get(msg, 0.0)
@@ -33,10 +37,15 @@ def configure_logging(level: str = "INFO", noisy_loggers: list[str] | None = Non
 
     console.addFilter(DedupFilter())
 
-    file_hdl = RotatingFileHandler("alert_engine.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    file_hdl = RotatingFileHandler(
+        "alert_engine.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+    )
     file_hdl.setLevel(logging.DEBUG)
 
-    fmt = logging.Formatter("%(asctime)s %(levelname)-8s [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     console.setFormatter(fmt)
     file_hdl.setFormatter(fmt)
 
@@ -85,6 +94,7 @@ def line_push(msg: str) -> None:
 
 # ──────────────────────────── 資料類別 ────────────────────────────
 
+
 @dataclass(slots=True)
 class StrategyConfig:
     delta_threshold: float = 0.30
@@ -116,7 +126,7 @@ class ContractConfig:
         c = Contract()
         if self.con_id:
             c.conId = self.con_id
-            c.exchange = "SMART"      # 維持你原本行為：避免 321
+            c.exchange = "SMART"  # 維持你原本行為：避免 321
             c.secType = "OPT"
             c.currency = "USD"
             return c
@@ -137,6 +147,7 @@ class ContractConfig:
 
 
 # ──────────────────────────── AlertEngine ────────────────────────────
+
 
 class AlertEngine:
     def __init__(self, app: IBApp, rule: StrategyConfig) -> None:
@@ -172,7 +183,12 @@ class AlertEngine:
         underlying_symbols = {cfg.symbol for cfg in self.cfgs.values()}
         for sym in underlying_symbols:
             stk = Contract()
-            stk.symbol, stk.secType, stk.exchange, stk.currency = sym, "STK", "SMART", "USD"
+            stk.symbol, stk.secType, stk.exchange, stk.currency = (
+                sym,
+                "STK",
+                "SMART",
+                "USD",
+            )
             self.app.subscribe(stk, False, sym)
         for key, cfg in self.cfgs.items():
             self.app.subscribe(cfg.to_ib(), True, key)
@@ -261,7 +277,10 @@ class AlertEngine:
                 log.info("市場即將開盤，30 秒後再次確認 ...")
                 time.sleep(30)
             else:
-                log.info("市場尚未開盤，預計開盤時間: %s", next_open.strftime("%Y-%m-%d %H:%M:%S %Z"))
+                log.info(
+                    "市場尚未開盤，預計開盤時間: %s",
+                    next_open.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                )
                 time.sleep(min(wait_seconds, 300))
         log.info("市場已開盤 (正規時段)，開始監控")
 
@@ -305,7 +324,10 @@ class AlertEngine:
         if not market_status["is_open"] and not self.market_closed_notified:
             next_open = market_status.get("next_open")
             if next_open:
-                log.info("市場已休市，下次開盤時間: %s", next_open.strftime("%Y-%m-%d %H:%M:%S %Z"))
+                log.info(
+                    "市場已休市，下次開盤時間: %s",
+                    next_open.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                )
             else:
                 log.info("市場已休市，無法確定下次開盤時間")
             self.market_closed_notified = True
@@ -328,7 +350,9 @@ class AlertEngine:
                     f"{pos['position']} @ {pos['avgCost']:.2f}"
                 )
             else:
-                summary.append(f"{pos['symbol']}: {pos['position']} @ {pos['avgCost']:.2f}")
+                summary.append(
+                    f"{pos['symbol']}: {pos['position']} @ {pos['avgCost']:.2f}"
+                )
         return "\n".join(summary) if summary else "無有效持倉"
 
     def refresh_positions(self, force: bool = False):
@@ -355,7 +379,9 @@ class AlertEngine:
                     self.prev_closes[symbol] = prev_close
                     log.debug("更新 %s 昨收價格: %.2f", symbol, prev_close)
 
-    def _get_underlying_prev_close(self, symbol: str, timeout: float = 10.0) -> Optional[float]:
+    def _get_underlying_prev_close(
+        self, symbol: str, timeout: float = 10.0
+    ) -> Optional[float]:
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout:
             data = self.app.get_stream_data(symbol)
@@ -409,7 +435,19 @@ class AlertEngine:
         det = self.app.req_contract_details_blocking(cfg.to_ib())
         if det:
             c = det[0].contract
-            cfg.con_id, cfg.trading_class, cfg.multiplier = c.conId, c.tradingClass, c.multiplier
+            cfg.con_id, cfg.trading_class, cfg.multiplier = (
+                c.conId,
+                c.tradingClass,
+                c.multiplier,
+            )
+
+    def _pick_price(self, d: dict):
+        # 依序嘗試：標準 last/bid/ask → 延遲 p68/p66/p67 → Mark Price p37
+        for k in ("last", "bid", "ask", "p68", "p66", "p67", "p37"):
+            v = d.get(k)
+            if isinstance(v, (int, float)) and v >= 0:
+                return v
+        return None
 
     # ─────────── 主迴圈 ────────────
     def loop(self) -> None:
@@ -423,7 +461,10 @@ class AlertEngine:
                     continue
 
                 self.market_closed_notified = False
-                log.debug("[%s] 開始檢查合約狀態", datetime.datetime.now().strftime("%H:%M:%S"))
+                log.debug(
+                    "[%s] 開始檢查合約狀態",
+                    datetime.datetime.now().strftime("%H:%M:%S"),
+                )
                 alerts: list[tuple[str, str]] = []
 
                 # 股票行情 / 跳空
@@ -446,11 +487,11 @@ class AlertEngine:
                 # 選擇權逐檔
                 for key, c in self.cfgs.items():
                     data = self.app.get_stream_data(key)
-                    price = data.get("last") or data.get("bid") or data.get("ask")
+                    price = self._pick_price(data)
                     delta = data.get("delta")
                     iv = data.get("iv")
                     if price is None or delta is None:
-                        log.warning("%s: 無法取得完整資料", key)
+                        log.warning("%s: 無法取得完整資料, data: %s", key, data)
                         continue
 
                     dte = self._dte(c.expiry)
@@ -459,7 +500,11 @@ class AlertEngine:
                     # Δ 門檻
                     if delta_abs >= self.rule.delta_threshold:
                         msg, aid = self.generate_detailed_alert(
-                            key, "delta", delta_abs, c, {"threshold": self.rule.delta_threshold}
+                            key,
+                            "delta",
+                            delta_abs,
+                            c,
+                            {"threshold": self.rule.delta_threshold},
                         )
                         alerts.append((msg, aid))
                         log.warning("%s Delta=%.3f 超過閾值", key, delta_abs)
@@ -473,14 +518,20 @@ class AlertEngine:
 
                     if pct >= self.rule.profit_target:
                         msg, aid = self.generate_detailed_alert(
-                            key, "profit", pct, c, {"target": self.rule.profit_target, "price": price}
+                            key,
+                            "profit",
+                            pct,
+                            c,
+                            {"target": self.rule.profit_target, "price": price},
                         )
                         alerts.append((msg, aid))
                         log.warning("%s 收益=%.1f%% 已達目標", key, pct * 100)
 
                     # DTE
                     if dte <= self.rule.min_dte:
-                        msg, aid = self.generate_detailed_alert(key, "dte", dte, c, {"min_dte": self.rule.min_dte})
+                        msg, aid = self.generate_detailed_alert(
+                            key, "dte", dte, c, {"min_dte": self.rule.min_dte}
+                        )
                         alerts.append((msg, aid))
                         log.warning("%s DTE=%d 低於閾值", key, dte)
 
@@ -490,7 +541,13 @@ class AlertEngine:
                     iv_str = f"{iv:.4f}" if iv else "NA"
                     log.debug(
                         "%s: Px=%.2f (%s) Δ=%.3f (ΔΔ=%s) IV=%s DTE=%d",
-                        key, price, pct_str, delta_abs, delta_diff, iv_str, dte,
+                        key,
+                        price,
+                        pct_str,
+                        delta_abs,
+                        delta_diff,
+                        iv_str,
+                        dte,
                     )
 
                 # 推播警報（去重）

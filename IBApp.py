@@ -1,3 +1,4 @@
+import math
 import re
 import time
 import threading
@@ -49,6 +50,16 @@ class IBApp(EWrapper, EClient):
         50: "put_oi",
         55: "call_vol",
         56: "put_vol",
+        66: "bid",  # Delayed Bid
+        67: "ask",  # Delayed Ask
+        68: "last",  # Delayed Last
+        69: "bid_size",  # Delayed Bid Size
+        70: "ask_size",  # Delayed Ask Size
+        71: "last_size",  # Delayed Last Size
+        72: "high",  # Delayed High
+        73: "low",  # Delayed Low
+        74: "volume",  # Delayed Volume
+        75: "prev_close",  # Delayed Close（昨收）
     }
 
     # -------------- 生命週期 --------------
@@ -158,6 +169,9 @@ class IBApp(EWrapper, EClient):
 
     # ---- Tick handlers（維持原始鍵值結構與行為）----
     def tickPrice(self, reqId, field, price, _):
+        if field in (1, 2, 4, 6, 7, 9, 14, 37, 66, 67, 68, 72, 73, 75, 76):
+            if price is None or price < 0:
+                return
         key = self.FIELD_MAP.get(field, f"p{field}")
         self.tickers.setdefault(reqId, {})[key] = price
         if reqId in self._stream_key_map:
@@ -177,6 +191,10 @@ class IBApp(EWrapper, EClient):
             self._stream_data.setdefault(k, {})[f"g{field}"] = value
 
     def tickOptionComputation(self, reqId, *args):
+        # ---- 解析 API 參數（Python 原生 API 9.7+ 的順序）----
+        # reqId, field, tickAttrib, iv, delta, optPrice, pvDiv, gamma, vega, theta, undPx
+        field = args[0] if len(args) > 0 else None
+        # tickAttrib = args[1]  # 如需可用，但目前不影響你邏輯
         iv = args[2] if len(args) > 2 else None
         delta = args[3] if len(args) > 3 else None
         gamma = args[6] if len(args) > 6 else None
@@ -184,18 +202,82 @@ class IBApp(EWrapper, EClient):
         theta = args[8] if len(args) > 8 else None
         undPx = args[9] if len(args) > 9 else None
 
-        rec = {
-            "iv": iv,
-            "delta": delta,
-            "gamma": gamma,
-            "vega": vega,
-            "theta": theta,
-            "undPx": undPx,
-        }
-        self.tickers.setdefault(reqId, {}).update(rec)
+        # ---- 將 -1 / 非數值 視為「無效」不覆蓋舊值 ----
+        def _clean(x):
+            if x is None:
+                return None
+            if isinstance(x, (int, float)):
+                if x == -1 or not math.isfinite(x):
+                    return None
+            return x
+
+        iv = _clean(iv)
+        delta = _clean(delta)
+        gamma = _clean(gamma)
+        vega = _clean(vega)
+        theta = _clean(theta)
+        undPx = _clean(undPx)
+
+        # ---- live 與 delayed 的 tickType 合併（10-13 與 80-83）----
+        # 10/11/12/13 = Bid/Ask/Last/Model Option Computation（即時）
+        # 80/81/82/83 = Delayed Bid/Ask/Last/Model Option Computation（延遲）
+        # 官方 tick types 對照表：66–76（延遲價量）與 80–83（延遲 Greeks）。:contentReference[oaicite:0]{index=0}
+        side = {
+            10: "bid",
+            11: "ask",
+            12: "last",
+            13: "model",
+            80: "bid",
+            81: "ask",
+            82: "last",
+            83: "model",
+        }.get(field)
+
+        # ---- 只在新值有效時才覆蓋，避免被 -1 蓋掉 ----
+        bucket = self.tickers.setdefault(reqId, {})
+        if iv is not None:
+            bucket["iv"] = iv
+        if delta is not None:
+            bucket["delta"] = delta
+        if gamma is not None:
+            bucket["gamma"] = gamma
+        if vega is not None:
+            bucket["vega"] = vega
+        if theta is not None:
+            bucket["theta"] = theta
+        if undPx is not None:
+            bucket["undPx"] = undPx
+
+        # （可選）保留 side 明細，若你之後要比較 bid/ask/last 計算版本
+        if side:
+            if iv is not None:
+                bucket[f"{side}_iv"] = iv
+            if delta is not None:
+                bucket[f"{side}_delta"] = delta
+            if gamma is not None:
+                bucket[f"{side}_gamma"] = gamma
+            if vega is not None:
+                bucket[f"{side}_vega"] = vega
+            if theta is not None:
+                bucket[f"{side}_theta"] = theta
+
+        # ---- 同步到 stream 快取（維持你原本行為）----
         if reqId in self._stream_key_map:
             k = self._stream_key_map[reqId]
-            self._stream_data.setdefault(k, {}).update(rec)
+            out = self._stream_data.setdefault(k, {})
+            for key in ("iv", "delta", "gamma", "vega", "theta", "undPx"):
+                if key in bucket:
+                    out[key] = bucket[key]
+            if side:
+                for key in (
+                    f"{side}_iv",
+                    f"{side}_delta",
+                    f"{side}_gamma",
+                    f"{side}_vega",
+                    f"{side}_theta",
+                ):
+                    if key in bucket:
+                        out[key] = bucket[key]
 
     # -------------- 單檔 Snapshot（行為不變）--------------
     def snapshot(self, con: Contract, is_opt: bool) -> Dict[str, Any]:
@@ -245,7 +327,9 @@ class IBApp(EWrapper, EClient):
     _last_server_time: Optional[datetime.datetime] = None
     _server_time_ts: float = 0.0  # monotonic 秒
 
-    def get_server_time(self, retry: int = 3, timeout: float = 5.0) -> Optional[datetime.datetime]:
+    def get_server_time(
+        self, retry: int = 3, timeout: float = 5.0
+    ) -> Optional[datetime.datetime]:
         for _ in range(retry):
             self.current_time_available.clear()
             self.current_time_queue.clear()
@@ -290,7 +374,10 @@ class IBApp(EWrapper, EClient):
 
     def is_market_open(self) -> Dict[str, Any]:
         now = datetime.datetime.now()
-        if self.market_status["last_check"] and (now - self.market_status["last_check"]).total_seconds() < 60:
+        if (
+            self.market_status["last_check"]
+            and (now - self.market_status["last_check"]).total_seconds() < 60
+        ):
             return self.market_status
 
         self.market_status["last_check"] = now
@@ -308,7 +395,9 @@ class IBApp(EWrapper, EClient):
             log.warning("無法獲取伺服器時間，超過寬限期 → 視為休市")
             self.market_status["is_open"] = False
             if self._last_server_time:
-                self._calculate_next_trading_day(self._last_server_time.astimezone(self.us_eastern))
+                self._calculate_next_trading_day(
+                    self._last_server_time.astimezone(self.us_eastern)
+                )
             return self.market_status
 
         et_time = server_time.astimezone(self.us_eastern)
@@ -333,7 +422,9 @@ class IBApp(EWrapper, EClient):
                 self._calculate_next_trading_day(et_time)
             return self.market_status
 
-        self.market_status["is_open"] = self._parse_trading_hours(trading_hours, et_time)
+        self.market_status["is_open"] = self._parse_trading_hours(
+            trading_hours, et_time
+        )
         if not self.market_status["is_open"]:
             self._calculate_next_trading_day(et_time)
         return self.market_status
@@ -350,7 +441,9 @@ class IBApp(EWrapper, EClient):
         details = self.contract_details_queue[0]
         return details.tradingHours
 
-    def _parse_trading_hours(self, trading_hours: str, current_time: datetime.datetime) -> bool:
+    def _parse_trading_hours(
+        self, trading_hours: str, current_time: datetime.datetime
+    ) -> bool:
         def _split_ranges(s: str):
             for seg in s.split(";"):
                 for rng in seg.split(","):
@@ -368,8 +461,14 @@ class IBApp(EWrapper, EClient):
             m = _RANGE_RE.match(rng)
             if not m or m["sdate"] != today:
                 continue
-            start_dt = tz.localize(datetime.datetime.strptime(m["sdate"] + m["stime"], "%Y%m%d%H%M"))
-            end_dt = tz.localize(datetime.datetime.strptime((m["edate"] or m["sdate"]) + m["etime"], "%Y%m%d%H%M"))
+            start_dt = tz.localize(
+                datetime.datetime.strptime(m["sdate"] + m["stime"], "%Y%m%d%H%M")
+            )
+            end_dt = tz.localize(
+                datetime.datetime.strptime(
+                    (m["edate"] or m["sdate"]) + m["etime"], "%Y%m%d%H%M"
+                )
+            )
             if start_dt <= current_time < end_dt:
                 return True
         return False
@@ -408,7 +507,9 @@ class IBApp(EWrapper, EClient):
         log.info(f"艙位數據接收完畢，共 {len(self._positions)} 筆")
         self._positions_completed.set()
 
-    def getPositions(self, timeout: float = 10.0, refresh: bool = True) -> List[Dict[str, Any]]:
+    def getPositions(
+        self, timeout: float = 10.0, refresh: bool = True
+    ) -> List[Dict[str, Any]]:
         if not self.isConnected():
             log.warning("無法獲取艙位數據 - 未連接")
             return []
