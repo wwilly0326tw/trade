@@ -452,7 +452,7 @@ class AlertEngine:
         # 依序嘗試：標準 last/bid/ask → 延遲 p68/p66/p67 → Mark Price p37
         for k in ("last", "bid", "ask", "p68", "p66", "p67", "p37"):
             v = d.get(k)
-            if isinstance(v, (int, float)) and v >= 0:
+            if isinstance(v, (int, float)) and v > 0:
                 return v
         return None
 
