@@ -326,10 +326,24 @@ class IBApp(EWrapper, EClient):
 
     _last_server_time: Optional[datetime.datetime] = None
     _server_time_ts: float = 0.0  # monotonic 秒
+    _server_time_extrapolate_max = 6 * 3600  # 允許外推的最長秒數（例如 6 小時）
 
     def get_server_time(
-        self, retry: int = 3, timeout: float = 5.0
+        self,
+        retry: int = 3,
+        timeout: float = 5.0,
+        extrapolate: bool = True,
+        soft_cache_age: float = 90.0,
+        hard_cache_age: Optional[float] = None,
     ) -> Optional[datetime.datetime]:
+        """
+        取得伺服器時間：
+        - 嘗試 N 次；成功則更新 _last_server_time 與 _server_time_ts。
+        - 失敗時：
+          a) 若距上次成功 < soft_cache_age（預設 90s），直接回舊值；
+          b) 若 extrapolate=True 且距上次成功 < _server_time_extrapolate_max，用 monotonic 外推；
+          c) 若指定 hard_cache_age 且未超過，也可回舊值（可當額外保險）。
+        """
         for _ in range(retry):
             self.current_time_available.clear()
             self.current_time_queue.clear()
@@ -341,10 +355,21 @@ class IBApp(EWrapper, EClient):
                 self._server_time_ts = time.monotonic()
                 return dt
             time.sleep(0.2)
-        if self._last_server_time and (time.monotonic() - self._server_time_ts) < 90:
-            return self._last_server_time
-        return None
 
+        if self._last_server_time:
+            age = time.monotonic() - self._server_time_ts
+            # a) 短期快取：直接回舊值
+            if age < soft_cache_age:
+                return self._last_server_time
+            # b) 外推（關鍵修補）：用單調時鐘推進伺服器時間
+            if extrapolate and age < self._server_time_extrapolate_max:
+                return self._last_server_time + datetime.timedelta(seconds=age)
+            # c) 可選：硬快取上限
+            if hard_cache_age is not None and age < hard_cache_age:
+                return self._last_server_time
+
+        return None
+    
     def check_recent_trades(self, symbol: str = "SPY") -> bool:
         self.historical_data_available.clear()
         self.historical_data_end_available.clear()
@@ -381,18 +406,20 @@ class IBApp(EWrapper, EClient):
             return self.market_status
 
         self.market_status["last_check"] = now
-        server_time = self.get_server_time()
+        server_time = self.get_server_time(extrapolate=True, soft_cache_age=90.0)
 
-        GRACE_PERIOD = 600  # 秒
+        # 允許短期失聯時維持開市（sticky-open）
+        STICKY_GRACE = 15 * 60  # 15 分鐘
+        was_open = self.market_status.get("is_open", False)
+
         if not server_time:
-            if (
-                self._last_server_time
-                and (time.monotonic() - self._server_time_ts) < GRACE_PERIOD
-                and self.market_status.get("is_open", False)
-            ):
-                log.warning("無法獲取伺服器時間 - 使用緩存判斷市場仍在交易 (grace)")
-                return self.market_status
-            log.warning("無法獲取伺服器時間，超過寬限期 → 視為休市")
+            if was_open:
+                # 若上一狀態為開市，且距離上次成功取時不超過 STICKY_GRACE，維持開市
+                age = time.monotonic() - self._server_time_ts if self._server_time_ts else 1e9
+                if age < STICKY_GRACE:
+                    log.warning("無法獲取伺服器時間 - sticky-open 生效，暫時視為仍在交易")
+                    return self.market_status
+            log.warning("無法獲取伺服器時間且超過黏著寬限 → 視為休市")
             self.market_status["is_open"] = False
             if self._last_server_time:
                 self._calculate_next_trading_day(
@@ -401,12 +428,14 @@ class IBApp(EWrapper, EClient):
             return self.market_status
 
         et_time = server_time.astimezone(self.us_eastern)
+
+        # 週末直接休市
         if et_time.weekday() >= 5:
-            log.info(f"今天是週{et_time.weekday()+1}，市場休市")
             self.market_status["is_open"] = False
             self._calculate_next_trading_day(et_time)
             return self.market_status
 
+        # 優先用 SPY 的交易時間（快取/查詢）
         spy_contract = Contract()
         spy_contract.symbol = "SPY"
         spy_contract.secType = "STK"
@@ -415,17 +444,24 @@ class IBApp(EWrapper, EClient):
 
         trading_hours = self.get_contract_trading_hours(spy_contract)
         if not trading_hours:
-            log.warning("無法獲取交易時間信息")
+            log.warning("無法獲取交易時間信息，改用最近成交偵測")
             has_recent_trades = self.check_recent_trades()
             self.market_status["is_open"] = has_recent_trades
             if not has_recent_trades:
                 self._calculate_next_trading_day(et_time)
             return self.market_status
 
-        self.market_status["is_open"] = self._parse_trading_hours(
-            trading_hours, et_time
-        )
-        if not self.market_status["is_open"]:
+        is_open_now = self._parse_trading_hours(trading_hours, et_time)
+
+        # 黏著邏輯：若剛好在一般收盤臨界（例如 16:00 附近）避免抖動
+        if was_open and not is_open_now:
+            # 收盤後 5 分鐘內，仍用「有無成交」確認一次，避免誤判
+            if et_time.time() <= datetime.time(16, 5):
+                if self.check_recent_trades():
+                    is_open_now = True
+
+        self.market_status["is_open"] = is_open_now
+        if not is_open_now:
             self._calculate_next_trading_day(et_time)
         return self.market_status
 
