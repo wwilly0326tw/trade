@@ -523,7 +523,7 @@ class AlertEngine:
                         )
 
                     # BUY：|Δ| <= 0.65 才警報
-                    elif (not is_sell) and delta_abs <= buy_floor:
+                    elif (not is_sell) and delta_abs <= buy_floor and delta_abs > 0:
                         msg, aid = self.generate_detailed_alert(
                             key,
                             "delta",
