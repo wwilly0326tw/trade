@@ -252,17 +252,6 @@ class AlertEngine:
             else:
                 log.warning("無法獲取 %s 昨收價格", symbol)
 
-    # ─────────── 等待函式 ────────────
-    def _wait_for_prev_close(self, timeout: float = 10.0) -> Optional[float]:
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            data = self.app.get_stream_data("SPY")
-            close_val = data.get("prev_close") or data.get("close")
-            if close_val:
-                return close_val
-            time.sleep(0.1)
-        return None
-
     def _wait_for_market_open(self) -> None:
         while not self.app.is_regular_market_open():
             next_open = self._next_regular_open_time()
