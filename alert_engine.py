@@ -428,7 +428,7 @@ class AlertEngine:
         else:  # gap
             emoji = "⚡"
             direction = "上漲" if value > 0 else "下跌"
-            detail = f"SPY {direction} {abs(value):.1%}，大幅跳空"
+            detail = f"{key} {direction} {abs(value):.1%}，大幅變動"
             action = f"請密切關注市場波動，{'PUT' if value > 0 else 'CALL'}選擇權可能受影響較大"
 
         full_message = f"{emoji} {today}\n{detail}\n{action}"
