@@ -525,14 +525,15 @@ class AlertEngine:
                             "%s Δ=%.3f (BUY) 低於 %.2f", key, delta_abs, buy_floor
                         )
 
-                    # 收益率（行為不變）
+                    # 收益率（僅針對賣方部位觸發）
                     base = abs(c.premium) or 1e-9
                     if c.action.upper() == "SELL":
                         pct = (base - price) / base
                     else:
                         pct = (price - base) / base
 
-                    if pct >= self.rule.profit_target:
+                    # 僅當為賣方部位（SELL）且達到獲利目標時才發出警報
+                    if is_sell and pct >= self.rule.profit_target:
                         msg, aid = self.generate_detailed_alert(
                             key,
                             "profit",
